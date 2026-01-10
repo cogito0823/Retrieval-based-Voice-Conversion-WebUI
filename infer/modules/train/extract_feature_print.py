@@ -22,6 +22,14 @@ import fairseq
 import numpy as np
 import soundfile as sf
 import torch
+# Fix PyTorch 2.6+ breaking fairseq loading
+_original_load = torch.load
+def safe_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = safe_load
+
 import torch.nn.functional as F
 
 if "privateuseone" not in device:

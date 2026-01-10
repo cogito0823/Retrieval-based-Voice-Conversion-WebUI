@@ -80,6 +80,8 @@ class Pipeline(object):
         self.t_center = self.sr * self.x_center  # 查询切点位置
         self.t_max = self.sr * self.x_max  # 免查询时长阈值
         self.device = config.device
+        # 缓存 faiss index / big_npy，避免每次推理都 reconstruct_n 导致极慢甚至假死
+        self._index_cache = {}  # file_index -> (index, big_npy)
 
     def get_f0(
         self,
@@ -143,13 +145,27 @@ class Pipeline(object):
             if not hasattr(self, "model_rmvpe"):
                 from infer.lib.rmvpe import RMVPE
 
-                logger.info(
-                    "Loading rmvpe model,%s" % "%s/rmvpe.pt" % os.environ["rmvpe_root"]
-                )
+                rmvpe_path = "%s/rmvpe.pt" % os.environ["rmvpe_root"]
+                t_load0 = ttime()
+                # RMVPE 默认跟随全局 device（例如 mps/cuda/cpu）。
+                # 若你遇到 macOS MPS 上偶发卡死，可手动降级：
+                # export RMVPE_DEVICE=cpu
+                rmvpe_device = os.environ.get("RMVPE_DEVICE", str(self.device))
+                if rmvpe_device == "mps" and str(self.device) != "mps":
+                    # 仅当整体 device 是 mps 才允许 rmvpe 用 mps
+                    rmvpe_device = str(self.device)
+
+                logger.info("Loading rmvpe model,%s (rmvpe_device=%s)", rmvpe_path, rmvpe_device)
                 self.model_rmvpe = RMVPE(
-                    "%s/rmvpe.pt" % os.environ["rmvpe_root"],
+                    rmvpe_path,
                     is_half=self.is_half,
-                    device=self.device,
+                    device=rmvpe_device,
+                )
+                logger.info(
+                    "RMVPE model loaded in %.2fs (device=%s, is_half=%s)",
+                    ttime() - t_load0,
+                    rmvpe_device,
+                    self.is_half,
                 )
             f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
 
@@ -298,23 +314,28 @@ class Pipeline(object):
         version,
         protect,
         f0_file=None,
+        progress_cb=None,
     ):
-        if (
-            file_index != ""
-            # and file_big_npy != ""
-            # and os.path.exists(file_big_npy) == True
-            and os.path.exists(file_index)
-            and index_rate != 0
-        ):
+        index = big_npy = None
+        if file_index and os.path.exists(file_index) and index_rate != 0:
             try:
-                index = faiss.read_index(file_index)
-                # big_npy = np.load(file_big_npy)
-                big_npy = index.reconstruct_n(0, index.ntotal)
-            except:
+                if callable(progress_cb):
+                    progress_cb("index", 0, 1, "加载索引…")
+                cached = self._index_cache.get(file_index)
+                if cached is None:
+                    index = faiss.read_index(file_index)
+                    big_npy = index.reconstruct_n(0, index.ntotal)
+                    # 推理阶段用 float32 更稳；半精度在 numpy 下收益不明显
+                    if isinstance(big_npy, np.ndarray) and big_npy.dtype != np.float32:
+                        big_npy = big_npy.astype(np.float32)
+                    self._index_cache[file_index] = (index, big_npy)
+                else:
+                    index, big_npy = cached
+                if callable(progress_cb):
+                    progress_cb("index", 1, 1, "索引就绪")
+            except Exception:
                 traceback.print_exc()
                 index = big_npy = None
-        else:
-            index = big_npy = None
         audio = signal.filtfilt(bh, ah, audio)
         audio_pad = np.pad(audio, (self.window // 2, self.window // 2), mode="reflect")
         opt_ts = []
@@ -351,6 +372,8 @@ class Pipeline(object):
         sid = torch.tensor(sid, device=self.device).unsqueeze(0).long()
         pitch, pitchf = None, None
         if if_f0 == 1:
+            if callable(progress_cb):
+                progress_cb("f0", 0, 1, f"提取 F0（{f0_method}）…")
             pitch, pitchf = self.get_f0(
                 input_audio_path,
                 audio_pad,
@@ -360,6 +383,8 @@ class Pipeline(object):
                 filter_radius,
                 inp_f0,
             )
+            if callable(progress_cb):
+                progress_cb("f0", 1, 1, "F0 提取完成")
             pitch = pitch[:p_len]
             pitchf = pitchf[:p_len]
             if "mps" not in str(self.device) or "xpu" not in str(self.device):
@@ -368,7 +393,12 @@ class Pipeline(object):
             pitchf = torch.tensor(pitchf, device=self.device).unsqueeze(0).float()
         t2 = ttime()
         times[1] += t2 - t1
+        total_segs = max(1, len(opt_ts) + 1)
+        seg_i = 0
         for t in opt_ts:
+            seg_i += 1
+            if callable(progress_cb):
+                progress_cb("infer", seg_i, total_segs, "推理分段处理中…")
             t = t // self.window * self.window
             if if_f0 == 1:
                 audio_opt.append(
@@ -406,6 +436,9 @@ class Pipeline(object):
                 )
             s = t
         if if_f0 == 1:
+            seg_i += 1
+            if callable(progress_cb):
+                progress_cb("infer", seg_i, total_segs, "推理分段处理中…")
             audio_opt.append(
                 self.vc(
                     model,
@@ -423,6 +456,9 @@ class Pipeline(object):
                 )[self.t_pad_tgt : -self.t_pad_tgt]
             )
         else:
+            seg_i += 1
+            if callable(progress_cb):
+                progress_cb("infer", seg_i, total_segs, "推理分段处理中…")
             audio_opt.append(
                 self.vc(
                     model,
@@ -440,6 +476,8 @@ class Pipeline(object):
                 )[self.t_pad_tgt : -self.t_pad_tgt]
             )
         audio_opt = np.concatenate(audio_opt)
+        if callable(progress_cb):
+            progress_cb("post", 0, 1, "后处理（RMS/重采样/归一化）…")
         if rms_mix_rate != 1:
             audio_opt = change_rms(audio, 16000, audio_opt, tgt_sr, rms_mix_rate)
         if tgt_sr != resample_sr >= 16000:
@@ -451,6 +489,8 @@ class Pipeline(object):
         if audio_max > 1:
             max_int16 /= audio_max
         audio_opt = (audio_opt * max_int16).astype(np.int16)
+        if callable(progress_cb):
+            progress_cb("post", 1, 1, "后处理完成")
         del pitch, pitchf, sid
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

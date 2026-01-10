@@ -1,5 +1,13 @@
 import os
 import sys
+
+# 尽量减少 OpenMP/BLAS 线程数，避免 macOS 下部分二进制库组合时触发崩溃
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 from dotenv import load_dotenv
 
 now_dir = os.getcwd()
@@ -15,11 +23,9 @@ from infer.lib.train.process_ckpt import (
 )
 from i18n.i18n import I18nAuto
 from configs.config import Config
-from sklearn.cluster import MiniBatchKMeans
 import torch, platform
 import numpy as np
 import gradio as gr
-import faiss
 import fairseq
 import pathlib
 import json
@@ -31,12 +37,46 @@ import traceback
 import threading
 import shutil
 import logging
+import faulthandler
+import signal
 
 
 logging.getLogger("numba").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+# 兼容性补丁：
+# gradio==3.34.0 在请求被中断/退出（例如 Ctrl-C）时，
+# Queue.process_events 可能触发：AttributeError: 'AsyncRequest' object has no attribute '_json_response_data'
+# 这属于 gradio 内部实现细节（与业务无关），这里兜底避免退出时刷一堆 asyncio 报错。
+try:
+    import gradio.utils as _gr_utils
+
+    if hasattr(_gr_utils, "AsyncRequest") and isinstance(
+        getattr(_gr_utils.AsyncRequest, "json", None), property
+    ):
+
+        def _safe_asyncrequest_json(self):
+            return getattr(self, "_json_response_data", {}) or {}
+
+        _gr_utils.AsyncRequest.json = property(_safe_asyncrequest_json)
+except Exception:
+    pass
+
+# 便于定位 Segmentation fault：将崩溃时的 Python 栈写入日志文件
+try:
+    _fh_path = os.path.join(os.getcwd(), "logs", "faulthandler.log")
+    os.makedirs(os.path.dirname(_fh_path), exist_ok=True)
+    _fh_file = open(_fh_path, "a", encoding="utf-8")
+    faulthandler.enable(file=_fh_file, all_threads=True)
+    try:
+        faulthandler.register(signal.SIGSEGV, file=_fh_file, all_threads=True, chain=True)
+    except Exception:
+        # 某些平台不允许注册 SIGSEGV，忽略即可
+        pass
+except Exception:
+    pass
 
 tmp = os.path.join(now_dir, "TEMP")
 shutil.rmtree(tmp, ignore_errors=True)
@@ -215,6 +255,33 @@ def if_done_multi(done, ps):
     done[0] = True
 
 
+def tail_text_file(path: str, max_chars: int = 12000) -> str:
+    """
+    Read the tail of a text file (best-effort).
+    Keeps UI responsive even when logs get large.
+    """
+    try:
+        if not os.path.exists(path):
+            return ""
+        # Read from end to avoid loading huge files
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - max_chars)
+            f.seek(start, os.SEEK_SET)
+            data = f.read()
+        # If we started mid-line, drop the first partial line
+        try:
+            text = data.decode("utf-8", errors="replace")
+        except Exception:
+            text = data.decode(errors="replace")
+        if start > 0 and "\n" in text:
+            text = text.split("\n", 1)[1]
+        return text
+    except Exception:
+        return traceback.format_exc()
+
+
 def preprocess_dataset(trainset_dir, exp_dir, sr, n_p):
     sr = sr_dict[sr]
     os.makedirs("%s/logs/%s" % (now_dir, exp_dir), exist_ok=True)
@@ -257,6 +324,8 @@ def preprocess_dataset(trainset_dir, exp_dir, sr, n_p):
 # but2.click(extract_f0,[gpus6,np7,f0method8,if_f0_3,trainset_dir4],[info2])
 def extract_f0_feature(gpus, n_p, f0method, if_f0, exp_dir, version19, gpus_rmvpe):
     gpus = gpus.split("-")
+    if config.device == "mps":
+        gpus = [gpus[0]]
     os.makedirs("%s/logs/%s" % (now_dir, exp_dir), exist_ok=True)
     f = open("%s/logs/%s/extract_f0_feature.log" % (now_dir, exp_dir), "w")
     f.close()
@@ -478,142 +547,240 @@ def click_train(
     if_save_every_weights18,
     version19,
 ):
-    # 生成filelist
-    exp_dir = "%s/logs/%s" % (now_dir, exp_dir1)
-    os.makedirs(exp_dir, exist_ok=True)
-    gt_wavs_dir = "%s/0_gt_wavs" % (exp_dir)
-    feature_dir = (
-        "%s/3_feature256" % (exp_dir)
-        if version19 == "v1"
-        else "%s/3_feature768" % (exp_dir)
-    )
-    if if_f0_3:
-        f0_dir = "%s/2a_f0" % (exp_dir)
-        f0nsf_dir = "%s/2b-f0nsf" % (exp_dir)
-        names = (
-            set([name.split(".")[0] for name in os.listdir(gt_wavs_dir)])
-            & set([name.split(".")[0] for name in os.listdir(feature_dir)])
-            & set([name.split(".")[0] for name in os.listdir(f0_dir)])
-            & set([name.split(".")[0] for name in os.listdir(f0nsf_dir)])
+    try:
+        # 生成filelist
+        logger.info(
+            "click_train called with: exp_dir1=%s, sr2=%s, version19=%s",
+            exp_dir1,
+            sr2,
+            version19,
         )
-    else:
-        names = set([name.split(".")[0] for name in os.listdir(gt_wavs_dir)]) & set(
-            [name.split(".")[0] for name in os.listdir(feature_dir)]
+        exp_dir = "%s/logs/%s" % (now_dir, exp_dir1)
+        os.makedirs(exp_dir, exist_ok=True)
+        gt_wavs_dir = "%s/0_gt_wavs" % (exp_dir)
+        feature_dir = (
+            "%s/3_feature256" % (exp_dir)
+            if version19 == "v1"
+            else "%s/3_feature768" % (exp_dir)
         )
-    opt = []
-    for name in names:
+
+        # 前置产物检查：必须先“处理数据”和“特征提取”(带f0时还需要f0文件夹)
+        missing_dirs = []
+        required_dirs = [
+            (gt_wavs_dir, "0_gt_wavs（处理数据后生成）"),
+            (feature_dir, "3_feature（特征提取后生成）"),
+        ]
+        f0_dir = None
+        f0nsf_dir = None
         if if_f0_3:
-            opt.append(
-                "%s/%s.wav|%s/%s.npy|%s/%s.wav.npy|%s/%s.wav.npy|%s"
+            f0_dir = "%s/2a_f0" % (exp_dir)
+            f0nsf_dir = "%s/2b-f0nsf" % (exp_dir)
+            required_dirs.extend(
+                [
+                    (f0_dir, "2a_f0（提取音高后生成）"),
+                    (f0nsf_dir, "2b-f0nsf（提取音高后生成）"),
+                ]
+            )
+        for p, desc in required_dirs:
+            if not os.path.isdir(p):
+                missing_dirs.append(f"{desc}: {p}")
+        if missing_dirs:
+            msg = (
+                "无法开始训练：缺少训练前置产物目录。\n"
+                + "\n".join(missing_dirs)
+                + "\n\n请按顺序先执行：\n"
+                + "1) 处理数据（生成 0_gt_wavs 等）\n"
+                + "2) 特征提取（生成 3_feature；若模型带F0还会生成 2a_f0/2b-f0nsf）\n"
+                + "完成后再点【训练模型】。"
+            )
+            logger.warning(msg)
+            yield msg
+            return
+
+        # 目录存在但为空也要拦截（常见于步骤没跑完/被中断）
+        if len(os.listdir(gt_wavs_dir)) == 0:
+            yield f"无法开始训练：{gt_wavs_dir} 为空。请先执行【处理数据】。"
+            return
+        if len(os.listdir(feature_dir)) == 0:
+            yield f"无法开始训练：{feature_dir} 为空。请先执行【特征提取】。"
+            return
+        if if_f0_3:
+            if f0_dir and len(os.listdir(f0_dir)) == 0:
+                yield f"无法开始训练：{f0_dir} 为空。请先执行【特征提取】(包含音高)。"
+                return
+            if f0nsf_dir and len(os.listdir(f0nsf_dir)) == 0:
+                yield f"无法开始训练：{f0nsf_dir} 为空。请先执行【特征提取】(包含音高)。"
+                return
+
+        if if_f0_3:
+            names = (
+                set([name.split(".")[0] for name in os.listdir(gt_wavs_dir)])
+                & set([name.split(".")[0] for name in os.listdir(feature_dir)])
+                & set([name.split(".")[0] for name in os.listdir(f0_dir)])
+                & set([name.split(".")[0] for name in os.listdir(f0nsf_dir)])
+            )
+        else:
+            names = set([name.split(".")[0] for name in os.listdir(gt_wavs_dir)]) & set(
+                [name.split(".")[0] for name in os.listdir(feature_dir)]
+            )
+        opt = []
+        for name in names:
+            if if_f0_3:
+                opt.append(
+                    "%s/%s.wav|%s/%s.npy|%s/%s.wav.npy|%s/%s.wav.npy|%s"
+                    % (
+                        gt_wavs_dir.replace("\\", "\\\\"),
+                        name,
+                        feature_dir.replace("\\", "\\\\"),
+                        name,
+                        f0_dir.replace("\\", "\\\\"),
+                        name,
+                        f0nsf_dir.replace("\\", "\\\\"),
+                        name,
+                        spk_id5,
+                    )
+                )
+            else:
+                opt.append(
+                    "%s/%s.wav|%s/%s.npy|%s"
+                    % (
+                        gt_wavs_dir.replace("\\", "\\\\"),
+                        name,
+                        feature_dir.replace("\\", "\\\\"),
+                        name,
+                        spk_id5,
+                    )
+                )
+        fea_dim = 256 if version19 == "v1" else 768
+        if if_f0_3:
+            for _ in range(2):
+                opt.append(
+                    "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|%s/logs/mute/2a_f0/mute.wav.npy|%s/logs/mute/2b-f0nsf/mute.wav.npy|%s"
+                    % (now_dir, sr2, now_dir, fea_dim, now_dir, now_dir, spk_id5)
+                )
+        else:
+            for _ in range(2):
+                opt.append(
+                    "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|%s"
+                    % (now_dir, sr2, now_dir, fea_dim, spk_id5)
+                )
+        shuffle(opt)
+        with open("%s/filelist.txt" % exp_dir, "w") as f:
+            f.write("\n".join(opt))
+        logger.debug("Write filelist done")
+
+        # 训练日志文件：实时回显用（训练脚本也会往这里写）
+        train_log_path = os.path.join(exp_dir, "train.log")
+        try:
+            open(train_log_path, "a", encoding="utf-8").close()
+        except Exception:
+            # fallback: do not block training if log file can't be touched
+            pass
+
+        logger.info("Use gpus: %s", str(gpus16))
+        if pretrained_G14 == "":
+            logger.info("No pretrained Generator")
+        if pretrained_D15 == "":
+            logger.info("No pretrained Discriminator")
+
+        if version19 == "v1" or sr2 == "40k":
+            config_path = "v1/%s.json" % sr2
+        else:
+            config_path = "v2/%s.json" % sr2
+        config_save_path = os.path.join(exp_dir, "config.json")
+        if not pathlib.Path(config_save_path).exists():
+            with open(config_save_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    config.json_config[config_path],
+                    f,
+                    ensure_ascii=False,
+                    indent=4,
+                    sort_keys=True,
+                )
+                f.write("\n")
+
+        if gpus16:
+            cmd = (
+                '"%s" infer/modules/train/train.py -e "%s" -sr %s -f0 %s -bs %s -g %s -te %s -se %s %s %s -l %s -c %s -sw %s -v %s'
                 % (
-                    gt_wavs_dir.replace("\\", "\\\\"),
-                    name,
-                    feature_dir.replace("\\", "\\\\"),
-                    name,
-                    f0_dir.replace("\\", "\\\\"),
-                    name,
-                    f0nsf_dir.replace("\\", "\\\\"),
-                    name,
-                    spk_id5,
+                    config.python_cmd,
+                    exp_dir1,
+                    sr2,
+                    1 if if_f0_3 else 0,
+                    batch_size12,
+                    gpus16,
+                    total_epoch11,
+                    save_epoch10,
+                    "-pg %s" % pretrained_G14 if pretrained_G14 != "" else "",
+                    "-pd %s" % pretrained_D15 if pretrained_D15 != "" else "",
+                    1 if if_save_latest13 == i18n("是") else 0,
+                    1 if if_cache_gpu17 == i18n("是") else 0,
+                    1 if if_save_every_weights18 == i18n("是") else 0,
+                    version19,
                 )
             )
         else:
-            opt.append(
-                "%s/%s.wav|%s/%s.npy|%s"
+            cmd = (
+                '"%s" infer/modules/train/train.py -e "%s" -sr %s -f0 %s -bs %s -te %s -se %s %s %s -l %s -c %s -sw %s -v %s'
                 % (
-                    gt_wavs_dir.replace("\\", "\\\\"),
-                    name,
-                    feature_dir.replace("\\", "\\\\"),
-                    name,
-                    spk_id5,
+                    config.python_cmd,
+                    exp_dir1,
+                    sr2,
+                    1 if if_f0_3 else 0,
+                    batch_size12,
+                    total_epoch11,
+                    save_epoch10,
+                    "-pg %s" % pretrained_G14 if pretrained_G14 != "" else "",
+                    "-pd %s" % pretrained_D15 if pretrained_D15 != "" else "",
+                    1 if if_save_latest13 == i18n("是") else 0,
+                    1 if if_cache_gpu17 == i18n("是") else 0,
+                    1 if if_save_every_weights18 == i18n("是") else 0,
+                    version19,
                 )
             )
-    fea_dim = 256 if version19 == "v1" else 768
-    if if_f0_3:
-        for _ in range(2):
-            opt.append(
-                "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|%s/logs/mute/2a_f0/mute.wav.npy|%s/logs/mute/2b-f0nsf/mute.wav.npy|%s"
-                % (now_dir, sr2, now_dir, fea_dim, now_dir, now_dir, spk_id5)
-            )
-    else:
-        for _ in range(2):
-            opt.append(
-                "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|%s"
-                % (now_dir, sr2, now_dir, fea_dim, spk_id5)
-            )
-    shuffle(opt)
-    with open("%s/filelist.txt" % exp_dir, "w") as f:
-        f.write("\n".join(opt))
-    logger.debug("Write filelist done")
-    # 生成config#无需生成config
-    # cmd = python_cmd + " train_nsf_sim_cache_sid_load_pretrain.py -e mi-test -sr 40k -f0 1 -bs 4 -g 0 -te 10 -se 5 -pg pretrained/f0G40k.pth -pd pretrained/f0D40k.pth -l 1 -c 0"
-    logger.info("Use gpus: %s", str(gpus16))
-    if pretrained_G14 == "":
-        logger.info("No pretrained Generator")
-    if pretrained_D15 == "":
-        logger.info("No pretrained Discriminator")
-    if version19 == "v1" or sr2 == "40k":
-        config_path = "v1/%s.json" % sr2
-    else:
-        config_path = "v2/%s.json" % sr2
-    config_save_path = os.path.join(exp_dir, "config.json")
-    if not pathlib.Path(config_save_path).exists():
-        with open(config_save_path, "w", encoding="utf-8") as f:
-            json.dump(
-                config.json_config[config_path],
-                f,
-                ensure_ascii=False,
-                indent=4,
-                sort_keys=True,
-            )
-            f.write("\n")
-    if gpus16:
-        cmd = (
-            '"%s" infer/modules/train/train.py -e "%s" -sr %s -f0 %s -bs %s -g %s -te %s -se %s %s %s -l %s -c %s -sw %s -v %s'
-            % (
-                config.python_cmd,
-                exp_dir1,
-                sr2,
-                1 if if_f0_3 else 0,
-                batch_size12,
-                gpus16,
-                total_epoch11,
-                save_epoch10,
-                "-pg %s" % pretrained_G14 if pretrained_G14 != "" else "",
-                "-pd %s" % pretrained_D15 if pretrained_D15 != "" else "",
-                1 if if_save_latest13 == i18n("是") else 0,
-                1 if if_cache_gpu17 == i18n("是") else 0,
-                1 if if_save_every_weights18 == i18n("是") else 0,
-                version19,
-            )
-        )
-    else:
-        cmd = (
-            '"%s" infer/modules/train/train.py -e "%s" -sr %s -f0 %s -bs %s -te %s -se %s %s %s -l %s -c %s -sw %s -v %s'
-            % (
-                config.python_cmd,
-                exp_dir1,
-                sr2,
-                1 if if_f0_3 else 0,
-                batch_size12,
-                total_epoch11,
-                save_epoch10,
-                "-pg %s" % pretrained_G14 if pretrained_G14 != "" else "",
-                "-pd %s" % pretrained_D15 if pretrained_D15 != "" else "",
-                1 if if_save_latest13 == i18n("是") else 0,
-                1 if if_cache_gpu17 == i18n("是") else 0,
-                1 if if_save_every_weights18 == i18n("是") else 0,
-                version19,
-            )
-        )
-    logger.info("Execute: " + cmd)
-    p = Popen(cmd, shell=True, cwd=now_dir)
-    p.wait()
-    return "训练结束, 您可查看控制台训练日志或实验文件夹下的train.log"
+        logger.info("Execute: %s", cmd)
+        p = Popen(cmd, shell=True, cwd=now_dir)
+        while p.poll() is None:
+            sleep(1)
+            # 实时回显 train.log（尾部），方便看到 step/epoch 进度
+            log_tail = tail_text_file(train_log_path)
+            if log_tail.strip():
+                yield log_tail
+            else:
+                yield "训练中...（等待 train.log 输出）"
+        rc = p.wait()
+        # train.py 结束时会 os._exit(2333333)，shell 中表现为 2333333 % 256 == 149
+        # 这里把 149 视为正常完成，避免 WebUI 误报“异常退出”
+        if rc not in (0, 149):
+            log_tail = tail_text_file(train_log_path)
+            if log_tail.strip():
+                yield log_tail + f"\n\n训练进程异常退出(exit code={rc})"
+            else:
+                yield f"训练进程异常退出(exit code={rc})，请查看控制台/实验目录下 train.log"
+        else:
+            log_tail = tail_text_file(train_log_path)
+            if log_tail.strip():
+                yield log_tail + "\n\n训练结束。"
+            else:
+                yield "训练结束, 您可查看控制台训练日志或实验文件夹下的train.log"
+    except Exception:
+        err = traceback.format_exc()
+        logger.error(err)
+        yield err
 
 
 # but4.click(train_index, [exp_dir1], info3)
 def train_index(exp_dir1, version19):
+    # 延迟导入：faiss / sklearn 在部分 macOS 环境下可能导致启动时崩溃
+    try:
+        import faiss  # type: ignore
+    except Exception as e:
+        return f"缺少 faiss 或 faiss 导入失败：{e}\n请先安装 faiss 后再训练索引。"
+    try:
+        from sklearn.cluster import MiniBatchKMeans  # type: ignore
+    except Exception as e:
+        return f"缺少 scikit-learn 或导入失败：{e}\n请先安装 scikit-learn 后再训练索引。"
+
     # exp_dir = "%s/logs/%s" % (now_dir, exp_dir1)
     exp_dir = "logs/%s" % (exp_dir1)
     os.makedirs(exp_dir, exist_ok=True)
@@ -753,7 +920,7 @@ def train1key(
 
     # step3a:训练模型
     yield get_info_str(i18n("step3a:正在训练模型"))
-    click_train(
+    for _ in click_train(
         exp_dir1,
         sr2,
         if_f0_3,
@@ -768,7 +935,8 @@ def train1key(
         if_cache_gpu17,
         if_save_every_weights18,
         version19,
-    )
+    ):
+        pass
     yield get_info_str(
         i18n("训练结束, 您可查看控制台训练日志或实验文件夹下的train.log")
     )
@@ -1609,11 +1777,20 @@ with gr.Blocks(title="RVC WebUI") as app:
                 gr.Markdown(traceback.format_exc())
 
     if config.iscolab:
-        app.queue(concurrency_count=511, max_size=1022).launch(share=True)
+        logger.info("Launching Gradio (colab mode)")
+        # 511 并发在本地/非GPU环境下容易触发底层库不稳定（甚至崩溃）
+        app.queue(concurrency_count=32, max_size=1022).launch(
+            share=True,
+            show_error=True,
+            debug=True,
+        )
     else:
-        app.queue(concurrency_count=511, max_size=1022).launch(
+        logger.info("Launching Gradio on 0.0.0.0:%s", config.listen_port)
+        app.queue(concurrency_count=32, max_size=1022).launch(
             server_name="0.0.0.0",
             inbrowser=not config.noautoopen,
             server_port=config.listen_port,
-            quiet=True,
+            quiet=False,
+            show_error=True,
+            debug=True,
         )

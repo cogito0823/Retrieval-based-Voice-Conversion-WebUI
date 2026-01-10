@@ -7,6 +7,12 @@ import numpy as np
 import soundfile as sf
 import torch
 from io import BytesIO
+import time
+import uuid
+import os
+import queue
+import threading
+from time import monotonic
 
 from infer.lib.audio import load_audio, wav2
 from infer.lib.infer_pack.models import (
@@ -17,6 +23,43 @@ from infer.lib.infer_pack.models import (
 )
 from infer.modules.vc.pipeline import Pipeline
 from infer.modules.vc.utils import *
+
+
+def _silent_audio(sr: int = 16000):
+    """
+    Gradio 的 Audio 组件不接受 (None, None)；
+    返回一个极短的静音片段用于占位，避免前端/后处理报错。
+    """
+    return _audio_to_gradio(sr, np.zeros(1600, dtype=np.int16))
+
+
+def _audio_to_gradio(sr: int, audio: np.ndarray):
+    """
+    某些环境下直接返回 (sr, np.ndarray) 会导致前端显示 Error 但后端无 traceback（数据过大/序列化问题）。
+    这里统一写到临时 wav 文件并返回路径，交给 gr.Audio 读取。
+    """
+    try:
+        tmp_dir = os.environ.get("TEMP") or os.path.join(os.getcwd(), "TEMP")
+        os.makedirs(tmp_dir, exist_ok=True)
+        out_path = os.path.join(
+            tmp_dir, f"rvc_vc_{int(time.time())}_{uuid.uuid4().hex}.wav"
+        )
+        # Pipeline 输出通常是 int16；明确写成 PCM_16
+        sf.write(out_path, audio, sr, subtype="PCM_16")
+        return out_path
+    except Exception:
+        # 回退：仍返回 tuple，至少不让函数崩
+        return (sr, audio)
+
+
+def _fmt_secs(s: float) -> str:
+    s = max(0, int(s))
+    h = s // 3600
+    m = (s % 3600) // 60
+    ss = s % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{ss:02d}"
+    return f"{m:02d}:{ss:02d}"
 
 
 class VC:
@@ -158,71 +201,194 @@ class VC:
         rms_mix_rate,
         protect,
     ):
-        if input_audio_path is None:
-            return "You need to upload an audio", None
-        f0_up_key = int(f0_up_key)
-        try:
-            audio = load_audio(input_audio_path, 16000)
-            audio_max = np.abs(audio).max() / 0.95
-            if audio_max > 1:
-                audio /= audio_max
-            times = [0, 0, 0]
+        # 用后台线程执行推理，generator 持续回传进度，避免前端超时显示 Error
+        q: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        silent = _silent_audio()
 
-            if self.hubert_model is None:
-                self.hubert_model = load_hubert(self.config)
+        def emit(msg: str):
+            try:
+                q.put(("msg", msg))
+            except Exception:
+                pass
 
-            if file_index:
-                file_index = (
-                    file_index.strip(" ")
-                    .strip('"')
-                    .strip("\n")
-                    .strip('"')
-                    .strip(" ")
-                    .replace("trained", "added")
+        def done(text: str, audio_out):
+            try:
+                q.put(("done", (text, audio_out)))
+            except Exception:
+                pass
+
+        def worker():
+            try:
+                t0 = monotonic()
+                # 进度权重（总和 1.0）
+                weights = {
+                    "audio": 0.06,   # 读取音频
+                    "hubert": 0.14,  # 加载 HuBERT（首次）
+                    "index": 0.06,   # 加载索引/缓存
+                    "f0": 0.24,      # 提取 F0（含 rmvpe 初始化）
+                    "infer": 0.40,   # 分段推理
+                    "post": 0.10,    # 后处理与写文件
+                }
+                stage_frac = {k: 0.0 for k in weights.keys()}
+
+                def overall_pct() -> float:
+                    return 100.0 * sum(weights[k] * stage_frac.get(k, 0.0) for k in weights)
+
+                def emit_progress(desc: str, extra: str = ""):
+                    pct = overall_pct()
+                    elapsed = monotonic() - t0
+                    if pct > 0.5:
+                        eta = elapsed * (100.0 - pct) / pct
+                        eta_s = _fmt_secs(eta)
+                    else:
+                        eta_s = "--:--"
+                    msg = f"{desc}  {pct:5.1f}% | 已用 {_fmt_secs(elapsed)} | 预计剩余 {eta_s}"
+                    if extra:
+                        msg += f"\n{extra}"
+                    emit(msg)
+
+                logger.info(
+                    "vc_single called: sid=%s, input_audio_path=%r, f0_method=%s, file_index=%r, file_index2=%r",
+                    sid,
+                    input_audio_path,
+                    f0_method,
+                    file_index,
+                    file_index2,
                 )
-            elif file_index2:
-                file_index = file_index2
-            else:
-                file_index = ""  # 防止小白写错，自动帮他替换掉
+                emit_progress("开始推理…")
 
-            audio_opt = self.pipeline.pipeline(
-                self.hubert_model,
-                self.net_g,
-                sid,
-                audio,
-                input_audio_path,
-                times,
-                f0_up_key,
-                f0_method,
-                file_index,
-                index_rate,
-                self.if_f0,
-                filter_radius,
-                self.tgt_sr,
-                resample_sr,
-                rms_mix_rate,
-                self.version,
-                protect,
-                f0_file,
-            )
-            if self.tgt_sr != resample_sr >= 16000:
-                tgt_sr = resample_sr
-            else:
-                tgt_sr = self.tgt_sr
-            index_info = (
-                "Index:\n%s." % file_index
-                if os.path.exists(file_index)
-                else "Index not used."
-            )
-            return (
-                "Success.\n%s\nTime:\nnpy: %.2fs, f0: %.2fs, infer: %.2fs."
-                % (index_info, *times),
-                (tgt_sr, audio_opt),
-            )
-        except:
-            info = traceback.format_exc()
-            logger.warning(info)
-            return info, (None, None)
+                if input_audio_path is None or input_audio_path == "":
+                    done("请填写输入音频路径（或上传音频）。", silent)
+                    return
+
+                if self.pipeline is None or self.net_g is None:
+                    done("请先在【推理音色】下拉框选择模型并等待加载完成，然后再点击【转换】。", silent)
+                    return
+
+                try:
+                    f0_up_key_i = int(f0_up_key)
+                except Exception:
+                    f0_up_key_i = 0
+
+                emit_progress("正在读取输入音频…")
+                audio = load_audio(input_audio_path, 16000)
+                stage_frac["audio"] = 1.0
+                audio_max = np.abs(audio).max() / 0.95
+                if audio_max > 1:
+                    audio /= audio_max
+                times = [0, 0, 0]
+
+                if self.hubert_model is None:
+                    emit_progress("正在加载 HuBERT…（首次会较慢）")
+                    self.hubert_model = load_hubert(self.config)
+                stage_frac["hubert"] = 1.0
+
+                if file_index:
+                    file_index_ = (
+                        file_index.strip(" ")
+                        .strip('"')
+                        .strip("\n")
+                        .strip('"')
+                        .strip(" ")
+                        .replace("trained", "added")
+                    )
+                elif file_index2:
+                    file_index_ = file_index2
+                else:
+                    file_index_ = ""
+
+                def progress_cb(*args):
+                    # 兼容：
+                    # - (cur,total,desc)
+                    # - (stage,cur,total,desc)
+                    stage = "infer"
+                    cur = 0
+                    total = 0
+                    desc = "处理中…"
+                    if len(args) == 3:
+                        cur, total, desc = args
+                    elif len(args) >= 4:
+                        stage, cur, total, desc = args[:4]
+
+                    if stage in stage_frac:
+                        if total and total > 0:
+                            stage_frac[stage] = min(1.0, max(0.0, float(cur) / float(total)))
+                            extra = f"{desc}（{cur}/{total}）"
+                        else:
+                            extra = str(desc)
+                            if "完成" in str(desc) or "就绪" in str(desc):
+                                stage_frac[stage] = 1.0
+                            else:
+                                stage_frac[stage] = max(stage_frac[stage], 0.01)
+                        emit_progress(str(desc), extra=extra)
+                    else:
+                        emit_progress(str(desc), extra=f"{desc}（{cur}/{total}）" if total else "")
+
+                emit_progress("准备进入推理…")
+                audio_opt = self.pipeline.pipeline(
+                    self.hubert_model,
+                    self.net_g,
+                    sid,
+                    audio,
+                    input_audio_path,
+                    times,
+                    f0_up_key_i,
+                    f0_method,
+                    file_index_,
+                    index_rate,
+                    self.if_f0,
+                    filter_radius,
+                    self.tgt_sr,
+                    resample_sr,
+                    rms_mix_rate,
+                    self.version,
+                    protect,
+                    f0_file,
+                    progress_cb=progress_cb,
+                )
+                stage_frac["infer"] = 1.0
+                stage_frac["post"] = 1.0
+
+                if self.tgt_sr != resample_sr >= 16000:
+                    tgt_sr = resample_sr
+                else:
+                    tgt_sr = self.tgt_sr
+
+                index_info = (
+                    "Index:\n%s." % file_index_
+                    if file_index_ and os.path.exists(file_index_)
+                    else "Index not used."
+                )
+                out_path = _audio_to_gradio(tgt_sr, audio_opt)
+                done(
+                    "Success.\n%s\nTime:\nnpy: %.2fs, f0: %.2fs, infer: %.2fs."
+                    % (index_info, *times),
+                    out_path,
+                )
+            except Exception as e:
+                info = traceback.format_exc()
+                logger.warning(info)
+                done(f"推理失败：{e}\n\n{info}", silent)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        # 主循环：持续输出进度
+        last_msg = "推理中…"
+        last_audio = silent
+        while True:
+            try:
+                kind, payload = q.get(timeout=1.0)
+            except queue.Empty:
+                # heartbeat，避免前端认为无响应
+                yield last_msg, last_audio
+                continue
+            if kind == "msg":
+                last_msg = str(payload)
+                yield last_msg, last_audio
+            elif kind == "done":
+                text, audio_out = payload
+                yield str(text), audio_out
+                break
 
     def vc_multi(
         self,

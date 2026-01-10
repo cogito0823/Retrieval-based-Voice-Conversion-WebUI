@@ -1,6 +1,8 @@
 import os
 import sys
 import logging
+import time
+from torch.profiler import profile, record_function, ProfilerActivity
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,10 @@ def main():
 
     if torch.cuda.is_available() == False and torch.backends.mps.is_available() == True:
         n_gpus = 1
+        logger = utils.get_logger(hps.model_dir)
+        run(0, 1, hps, logger)
+        return
+
     if n_gpus < 1:
         # patch to unblock people without gpus. there is probably a better way.
         print("NO GPU DETECTED: falling back to CPU - this may take a while")
@@ -126,9 +132,11 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-    dist.init_process_group(
-        backend="gloo", init_method="env://", world_size=n_gpus, rank=rank
-    )
+    # Fix for Mac MPS: do not init dist group if using MPS
+    if not (torch.backends.mps.is_available() and n_gpus == 1):
+        dist.init_process_group(
+            backend="gloo", init_method="env://", world_size=n_gpus, rank=rank
+        )
     torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
@@ -154,13 +162,13 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         collate_fn = TextAudioCollate()
     train_loader = DataLoader(
         train_dataset,
-        num_workers=4,
+        num_workers=0, # Try 0 for Mac optimization
         shuffle=False,
-        pin_memory=True,
+        pin_memory=False, # Disable pin_memory for MPS
         collate_fn=collate_fn,
         batch_sampler=train_sampler,
-        persistent_workers=True,
-        prefetch_factor=8,
+        persistent_workers=False, # Cannot use persistent_workers with num_workers=0
+        prefetch_factor=None, # Cannot use with num_workers=0
     )
     if hps.if_f0 == 1:
         net_g = RVC_Model_f0(
@@ -201,6 +209,9 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
     elif torch.cuda.is_available():
         net_g = DDP(net_g, device_ids=[rank])
         net_d = DDP(net_d, device_ids=[rank])
+    elif torch.backends.mps.is_available():
+        # Mac MPS: Do NOT wrap with DDP
+        pass 
     else:
         net_g = DDP(net_g)
         net_d = DDP(net_d)
@@ -426,6 +437,7 @@ def train_and_evaluate(
             # wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
 
         # Calculate
+        t_start = ttime()
         with autocast(enabled=hps.train.fp16_run):
             if hps.if_f0 == 1:
                 (
@@ -477,6 +489,7 @@ def train_and_evaluate(
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                     y_d_hat_r, y_d_hat_g
                 )
+        t_mid = ttime()
         optim_d.zero_grad()
         scaler.scale(loss_disc).backward()
         scaler.unscale_(optim_d)
@@ -498,9 +511,11 @@ def train_and_evaluate(
         grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
         scaler.step(optim_g)
         scaler.update()
+        t_end = ttime()
 
         if rank == 0:
             if global_step % hps.train.log_interval == 0:
+                logger.info(f"Step Time: Total={t_end-t_start:.3f}s | Forward={(t_mid-t_start):.3f}s | Backward={(t_end-t_mid):.3f}s")
                 lr = optim_g.param_groups[0]["lr"]
                 logger.info(
                     "Train Epoch: {} [{:.0f}%]".format(
