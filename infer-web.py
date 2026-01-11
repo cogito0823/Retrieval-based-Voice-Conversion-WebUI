@@ -39,6 +39,8 @@ import shutil
 import logging
 import faulthandler
 import signal
+import re
+import datetime
 
 
 logging.getLogger("numba").setLevel(logging.WARNING)
@@ -280,6 +282,129 @@ def tail_text_file(path: str, max_chars: int = 12000) -> str:
         return text
     except Exception:
         return traceback.format_exc()
+
+
+_RE_TRAIN_EPOCH_PCT = re.compile(r"Train Epoch:\s*(\d+)\s*\[\s*(\d+)%\s*\]")
+_RE_EPOCH_DONE = re.compile(r"====>\s*Epoch:\s*(\d+)\b")
+_RE_EPOCH_ELAPSED = re.compile(r"====>\s*Epoch:\s*(\d+).*?\|\s*\(([^)]+)\)")
+
+
+def parse_train_progress(log_text: str, total_epoch):
+    """
+    Parse training progress from train.log tail.
+    Returns: (progress_pct: int, status: str)
+    """
+    def _parse_timedelta_seconds(td_str: str):
+        # Expect formats like "0:05:35.584586" or "5:35.12"
+        try:
+            parts = td_str.strip().split(":")
+            if len(parts) == 3:
+                h = int(parts[0])
+                m = int(parts[1])
+                s = float(parts[2])
+                return h * 3600 + m * 60 + s
+            if len(parts) == 2:
+                m = int(parts[0])
+                s = float(parts[1])
+                return m * 60 + s
+            if len(parts) == 1:
+                return float(parts[0])
+        except Exception:
+            return None
+        return None
+
+    def _format_eta(seconds: float | None) -> str:
+        if seconds is None:
+            return "计算中…"
+        try:
+            if seconds < 0:
+                seconds = 0
+            # Keep it compact: H:MM:SS (or D days, H:MM:SS if large)
+            return str(datetime.timedelta(seconds=int(seconds)))
+        except Exception:
+            return "计算中…"
+
+    try:
+        total = int(float(total_epoch))
+    except Exception:
+        total = 0
+    if total < 0:
+        total = 0
+
+    epoch = None
+    pct_in_epoch = None
+
+    last = None
+    for last in _RE_TRAIN_EPOCH_PCT.finditer(log_text or ""):
+        pass
+    if last is not None:
+        try:
+            epoch = int(last.group(1))
+            pct_in_epoch = int(last.group(2))
+        except Exception:
+            epoch = None
+            pct_in_epoch = None
+
+    last_done = None
+    for last_done in _RE_EPOCH_DONE.finditer(log_text or ""):
+        pass
+    epoch_done = None
+    if last_done is not None:
+        try:
+            epoch_done = int(last_done.group(1))
+        except Exception:
+            epoch_done = None
+
+    # Parse recent epoch durations to estimate ETA
+    elapsed_secs = []
+    for m3 in _RE_EPOCH_ELAPSED.finditer(log_text or ""):
+        try:
+            e = int(m3.group(1))
+            td = m3.group(2)
+            sec = _parse_timedelta_seconds(td)
+            if sec is not None and sec > 0:
+                elapsed_secs.append((e, sec))
+        except Exception:
+            continue
+    # Use last few epochs to smooth noise
+    avg_epoch_sec = None
+    if elapsed_secs:
+        recent = [sec for _, sec in elapsed_secs[-3:]]
+        if recent:
+            avg_epoch_sec = sum(recent) / len(recent)
+
+    # Prefer within-epoch percentage if available
+    if epoch is not None and pct_in_epoch is not None:
+        pct_in_epoch = max(0, min(100, pct_in_epoch))
+        if total > 0:
+            overall = ((epoch - 1) + pct_in_epoch / 100.0) / total * 100.0
+            progress = int(max(0, min(100, round(overall))))
+            # ETA: remaining part of current epoch + remaining full epochs
+            eta = None
+            if avg_epoch_sec is not None:
+                eta = (1.0 - pct_in_epoch / 100.0) * avg_epoch_sec + max(
+                    0, (total - epoch)
+                ) * avg_epoch_sec
+            status = f"Epoch {epoch}/{total}，本轮 {pct_in_epoch}% ，预计剩余 {_format_eta(eta)}"
+        else:
+            progress = pct_in_epoch
+            status = f"Epoch {epoch}，本轮 {pct_in_epoch}% ，预计剩余 {_format_eta(None)}"
+        return progress, status
+
+    # Fallback: epoch done line
+    if epoch_done is not None:
+        if total > 0:
+            progress = int(max(0, min(100, round(epoch_done / total * 100.0))))
+            eta = None
+            if avg_epoch_sec is not None:
+                eta = max(0, (total - epoch_done)) * avg_epoch_sec
+            status = f"已完成 Epoch {epoch_done}/{total} ，预计剩余 {_format_eta(eta)}"
+        else:
+            progress = 0
+            status = f"已完成 Epoch {epoch_done} ，预计剩余 {_format_eta(None)}"
+        return progress, status
+
+    return 0, "等待训练日志输出…"
 
 
 def preprocess_dataset(trainset_dir, exp_dir, sr, n_p):
@@ -594,22 +719,30 @@ def click_train(
                 + "完成后再点【训练模型】。"
             )
             logger.warning(msg)
-            yield msg
+            yield msg, 0, i18n("未开始")
             return
 
         # 目录存在但为空也要拦截（常见于步骤没跑完/被中断）
         if len(os.listdir(gt_wavs_dir)) == 0:
-            yield f"无法开始训练：{gt_wavs_dir} 为空。请先执行【处理数据】。"
+            yield f"无法开始训练：{gt_wavs_dir} 为空。请先执行【处理数据】。", 0, i18n("未开始")
             return
         if len(os.listdir(feature_dir)) == 0:
-            yield f"无法开始训练：{feature_dir} 为空。请先执行【特征提取】。"
+            yield f"无法开始训练：{feature_dir} 为空。请先执行【特征提取】。", 0, i18n("未开始")
             return
         if if_f0_3:
             if f0_dir and len(os.listdir(f0_dir)) == 0:
-                yield f"无法开始训练：{f0_dir} 为空。请先执行【特征提取】(包含音高)。"
+                yield (
+                    f"无法开始训练：{f0_dir} 为空。请先执行【特征提取】(包含音高)。",
+                    0,
+                    i18n("未开始"),
+                )
                 return
             if f0nsf_dir and len(os.listdir(f0nsf_dir)) == 0:
-                yield f"无法开始训练：{f0nsf_dir} 为空。请先执行【特征提取】(包含音高)。"
+                yield (
+                    f"无法开始训练：{f0nsf_dir} 为空。请先执行【特征提取】(包含音高)。",
+                    0,
+                    i18n("未开始"),
+                )
                 return
 
         if if_f0_3:
@@ -690,8 +823,12 @@ def click_train(
         config_save_path = os.path.join(exp_dir, "config.json")
         if not pathlib.Path(config_save_path).exists():
             with open(config_save_path, "w", encoding="utf-8") as f:
+                # 深拷贝一份模板，避免意外修改全局模板
+                cfg = json.loads(json.dumps(config.json_config[config_path]))
+                # 默认更密集的日志输出，便于进度展示（如需更省日志可改大）
+                cfg.setdefault("train", {})["log_interval"] = 1
                 json.dump(
-                    config.json_config[config_path],
+                    cfg,
                     f,
                     ensure_ascii=False,
                     indent=4,
@@ -744,29 +881,43 @@ def click_train(
             sleep(1)
             # 实时回显 train.log（尾部），方便看到 step/epoch 进度
             log_tail = tail_text_file(train_log_path)
+            progress, status = parse_train_progress(log_tail, total_epoch11)
             if log_tail.strip():
-                yield log_tail
+                yield log_tail, progress, status
             else:
-                yield "训练中...（等待 train.log 输出）"
+                yield "训练中...（等待 train.log 输出）", progress, status
         rc = p.wait()
         # train.py 结束时会 os._exit(2333333)，shell 中表现为 2333333 % 256 == 149
         # 这里把 149 视为正常完成，避免 WebUI 误报“异常退出”
         if rc not in (0, 149):
             log_tail = tail_text_file(train_log_path)
+            progress, status = parse_train_progress(log_tail, total_epoch11)
             if log_tail.strip():
-                yield log_tail + f"\n\n训练进程异常退出(exit code={rc})"
+                yield (
+                    log_tail + f"\n\n训练进程异常退出(exit code={rc})",
+                    progress,
+                    status,
+                )
             else:
-                yield f"训练进程异常退出(exit code={rc})，请查看控制台/实验目录下 train.log"
+                yield (
+                    f"训练进程异常退出(exit code={rc})，请查看控制台/实验目录下 train.log",
+                    progress,
+                    status,
+                )
         else:
             log_tail = tail_text_file(train_log_path)
             if log_tail.strip():
-                yield log_tail + "\n\n训练结束。"
+                yield log_tail + "\n\n训练结束。", 100, i18n("已完成")
             else:
-                yield "训练结束, 您可查看控制台训练日志或实验文件夹下的train.log"
+                yield (
+                    "训练结束, 您可查看控制台训练日志或实验文件夹下的train.log",
+                    100,
+                    i18n("已完成"),
+                )
     except Exception:
         err = traceback.format_exc()
         logger.error(err)
-        yield err
+        yield err, 0, i18n("异常")
 
 
 # but4.click(train_index, [exp_dir1], info3)
@@ -828,6 +979,7 @@ def train_index(exp_dir1, version19):
     n_ivf = min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39)
     infos.append("%s,%s" % (big_npy.shape, n_ivf))
     yield "\n".join(infos)
+
     index = faiss.index_factory(256 if version19 == "v1" else 768, "IVF%s,Flat" % n_ivf)
     # index = faiss.index_factory(256if version19=="v1"else 768, "IVF%s,PQ128x4fs,RFlat"%n_ivf)
     infos.append("training")
@@ -855,27 +1007,54 @@ def train_index(exp_dir1, version19):
         % (n_ivf, index_ivf.nprobe, exp_dir1, version19)
     )
     try:
-        link = os.link if platform.system() == "Windows" else os.symlink
-        link(
-            "%s/added_IVF%s_Flat_nprobe_%s_%s_%s.index"
-            % (exp_dir, n_ivf, index_ivf.nprobe, exp_dir1, version19),
-            "%s/%s_IVF%s_Flat_nprobe_%s_%s_%s.index"
-            % (
+        if outside_index_root:
+            os.makedirs(outside_index_root, exist_ok=True)
+            src = "%s/added_IVF%s_Flat_nprobe_%s_%s_%s.index" % (
+                exp_dir,
+                n_ivf,
+                index_ivf.nprobe,
+                exp_dir1,
+                version19,
+            )
+            dst = "%s/%s_IVF%s_Flat_nprobe_%s_%s_%s.index" % (
                 outside_index_root,
                 exp_dir1,
                 n_ivf,
                 index_ivf.nprobe,
                 exp_dir1,
                 version19,
-            ),
-        )
-        infos.append("链接索引到外部-%s" % (outside_index_root))
-    except:
-        infos.append("链接索引到外部-%s失败" % (outside_index_root))
+            )
+            # If existing file/link conflicts, remove then recreate
+            if os.path.lexists(dst):
+                try:
+                    os.remove(dst)
+                except Exception:
+                    pass
+            # Windows uses hardlink by default in upstream; fallback to symlink if cross-device
+            if platform.system() == "Windows":
+                try:
+                    os.link(src, dst)
+                except Exception:
+                    os.symlink(src, dst)
+            else:
+                os.symlink(src, dst)
+            infos.append("链接索引到外部-%s" % (outside_index_root))
+        else:
+            infos.append("未配置 outside_index_root，跳过链接索引到外部")
+    except Exception as e:
+        infos.append("链接索引到外部-%s失败：%s" % (outside_index_root, str(e)))
 
     # faiss.write_index(index, '%s/added_IVF%s_Flat_FastScan_%s.index'%(exp_dir,n_ivf,version19))
     # infos.append("成功构建索引，added_IVF%s_Flat_FastScan_%s.index"%(n_ivf,version19))
     yield "\n".join(infos)
+
+
+def train_index_ui(exp_dir1, version19):
+    """
+    UI wrapper: returns (log, progress, status) for gradio outputs.
+    """
+    for msg in train_index(exp_dir1, version19):
+        yield msg, 100, i18n("索引训练")
 
 
 # but5.click(train1key, [exp_dir1, sr2, if_f0_3, trainset_dir4, spk_id5, gpus6, np7, f0method8, save_epoch10, total_epoch11, batch_size12, if_save_latest13, pretrained_G14, pretrained_D15, gpus16, if_cache_gpu17], info3)
@@ -899,28 +1078,21 @@ def train1key(
     version19,
     gpus_rmvpe,
 ):
-    infos = []
-
-    def get_info_str(strr):
-        infos.append(strr)
-        return "\n".join(infos)
-
     # step1:处理数据
-    yield get_info_str(i18n("step1:正在处理数据"))
-    [get_info_str(_) for _ in preprocess_dataset(trainset_dir4, exp_dir1, sr2, np7)]
+    yield i18n("step1:正在处理数据"), 0, i18n("数据处理")
+    for log in preprocess_dataset(trainset_dir4, exp_dir1, sr2, np7):
+        yield log, 0, i18n("数据处理")
 
     # step2a:提取音高
-    yield get_info_str(i18n("step2:正在提取音高&正在提取特征"))
-    [
-        get_info_str(_)
-        for _ in extract_f0_feature(
-            gpus16, np7, f0method8, if_f0_3, exp_dir1, version19, gpus_rmvpe
-        )
-    ]
+    yield i18n("step2:正在提取音高&正在提取特征"), 0, i18n("特征提取")
+    for log in extract_f0_feature(
+        gpus16, np7, f0method8, if_f0_3, exp_dir1, version19, gpus_rmvpe
+    ):
+        yield log, 0, i18n("特征提取")
 
     # step3a:训练模型
-    yield get_info_str(i18n("step3a:正在训练模型"))
-    for _ in click_train(
+    yield i18n("step3a:正在训练模型"), 0, i18n("训练中")
+    for log, progress, status in click_train(
         exp_dir1,
         sr2,
         if_f0_3,
@@ -936,14 +1108,13 @@ def train1key(
         if_save_every_weights18,
         version19,
     ):
-        pass
-    yield get_info_str(
-        i18n("训练结束, 您可查看控制台训练日志或实验文件夹下的train.log")
-    )
+        yield log, progress, status
 
     # step3b:训练索引
-    [get_info_str(_) for _ in train_index(exp_dir1, version19)]
-    yield get_info_str(i18n("全流程结束！"))
+    yield i18n("step3b:正在训练索引"), 100, i18n("索引训练")
+    for log in train_index(exp_dir1, version19):
+        yield log, 100, i18n("索引训练")
+    yield i18n("全流程结束！"), 100, i18n("已完成")
 
 
 #                    ckpt_path2.change(change_info_,[ckpt_path2],[sr__,if_f0__])
@@ -1541,6 +1712,20 @@ with gr.Blocks(title="RVC WebUI") as app:
                     but4 = gr.Button(i18n("训练特征索引"), variant="primary")
                     but5 = gr.Button(i18n("一键训练"), variant="primary")
                     info3 = gr.Textbox(label=i18n("输出信息"), value="", max_lines=10)
+                    train_progress = gr.Slider(
+                        minimum=0,
+                        maximum=100,
+                        step=1,
+                        label=i18n("训练进度(%)"),
+                        value=0,
+                        interactive=False,
+                    )
+                    train_status = gr.Textbox(
+                        label=i18n("训练状态"),
+                        value=i18n("未开始"),
+                        max_lines=1,
+                        interactive=False,
+                    )
                     but3.click(
                         click_train,
                         [
@@ -1559,10 +1744,14 @@ with gr.Blocks(title="RVC WebUI") as app:
                             if_save_every_weights18,
                             version19,
                         ],
-                        info3,
+                        [info3, train_progress, train_status],
                         api_name="train_start",
                     )
-                    but4.click(train_index, [exp_dir1, version19], info3)
+                    but4.click(
+                        train_index_ui,
+                        [exp_dir1, version19],
+                        [info3, train_progress, train_status],
+                    )
                     but5.click(
                         train1key,
                         [
@@ -1585,7 +1774,7 @@ with gr.Blocks(title="RVC WebUI") as app:
                             version19,
                             gpus_rmvpe,
                         ],
-                        info3,
+                        [info3, train_progress, train_status],
                         api_name="train_start_all",
                     )
 

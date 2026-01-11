@@ -3,6 +3,7 @@ import sys
 import logging
 import time
 from torch.profiler import profile, record_function, ProfilerActivity
+from contextlib import nullcontext
 
 logger = logging.getLogger(__name__)
 
@@ -26,14 +27,41 @@ try:
     if torch.xpu.is_available():
         from infer.modules.ipex import ipex_init
         from infer.modules.ipex.gradscaler import gradscaler_init
-        from torch.xpu.amp import autocast
+        from torch.xpu.amp import autocast as _legacy_autocast
 
         GradScaler = gradscaler_init()
         ipex_init()
     else:
-        from torch.cuda.amp import GradScaler, autocast
+        from torch.cuda.amp import GradScaler
+        from torch.cuda.amp import autocast as _legacy_autocast
 except Exception:
-    from torch.cuda.amp import GradScaler, autocast
+    from torch.cuda.amp import GradScaler
+    from torch.cuda.amp import autocast as _legacy_autocast
+
+try:
+    # PyTorch>=2.x: prefer new unified AMP API (avoids deprecation warnings)
+    from torch.amp import autocast as _amp_autocast  # type: ignore
+
+    _HAS_TORCH_AMP = True
+except Exception:
+    _HAS_TORCH_AMP = False
+    _amp_autocast = None  # type: ignore
+
+# Each subprocess will set this in run()
+AMP_DEVICE_TYPE = "cuda"
+
+
+def autocast_ctx(enabled: bool):
+    """
+    Autocast context manager compatible with old/new PyTorch AMP APIs.
+    """
+    if not enabled:
+        return nullcontext()
+    if _HAS_TORCH_AMP and _amp_autocast is not None:
+        # torch.amp.autocast(device_type=..., enabled=...)
+        return _amp_autocast(device_type=AMP_DEVICE_TYPE, enabled=True)
+    # Fallback: legacy autocast (may emit FutureWarning on newer torch)
+    return _legacy_autocast(enabled=True)
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
@@ -125,6 +153,7 @@ def main():
 
 def run(rank, n_gpus, hps, logger: logging.Logger):
     global global_step
+    global AMP_DEVICE_TYPE
     if rank == 0:
         # logger = utils.get_logger(hps.model_dir)
         logger.info(hps)
@@ -140,6 +169,13 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
     torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
+        AMP_DEVICE_TYPE = "cuda"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        AMP_DEVICE_TYPE = "xpu"
+    elif torch.backends.mps.is_available():
+        AMP_DEVICE_TYPE = "mps"
+    else:
+        AMP_DEVICE_TYPE = "cpu"
 
     if hps.if_f0 == 1:
         train_dataset = TextAudioLoaderMultiNSFsid(hps.data.training_files, hps.data)
@@ -438,7 +474,7 @@ def train_and_evaluate(
 
         # Calculate
         t_start = ttime()
-        with autocast(enabled=hps.train.fp16_run):
+        with autocast_ctx(hps.train.fp16_run):
             if hps.if_f0 == 1:
                 (
                     y_hat,
@@ -466,7 +502,7 @@ def train_and_evaluate(
             y_mel = commons.slice_segments(
                 mel, ids_slice, hps.train.segment_size // hps.data.hop_length
             )
-            with autocast(enabled=False):
+            with autocast_ctx(False):
                 y_hat_mel = mel_spectrogram_torch(
                     y_hat.float().squeeze(1),
                     hps.data.filter_length,
@@ -485,7 +521,7 @@ def train_and_evaluate(
 
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
-            with autocast(enabled=False):
+            with autocast_ctx(False):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                     y_d_hat_r, y_d_hat_g
                 )
@@ -496,10 +532,10 @@ def train_and_evaluate(
         grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
         scaler.step(optim_d)
 
-        with autocast(enabled=hps.train.fp16_run):
+        with autocast_ctx(hps.train.fp16_run):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
-            with autocast(enabled=False):
+            with autocast_ctx(False):
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                 loss_fm = feature_loss(fmap_r, fmap_g)
