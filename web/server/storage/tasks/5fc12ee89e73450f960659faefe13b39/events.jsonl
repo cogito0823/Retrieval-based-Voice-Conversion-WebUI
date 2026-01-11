@@ -1,0 +1,13 @@
+{"ts": 1768118562.637294, "kind": "status", "status": "queued"}
+{"ts": 1768118562.6377, "kind": "status", "status": "running", "progress": 0.0}
+{"ts": 1768118562.638607, "kind": "info", "text": "Loading model: 111.pth"}
+{"ts": 1768118563.498295, "kind": "log", "text": "开始推理…    0.0% | 已用 00:00 | 预计剩余 --:--"}
+{"ts": 1768118563.521588, "kind": "log", "text": "正在读取输入音频…    0.0% | 已用 00:00 | 预计剩余 --:--"}
+{"ts": 1768118564.525229, "kind": "log", "text": "正在读取输入音频…    0.0% | 已用 00:00 | 预计剩余 --:--"}
+{"ts": 1768118564.778495, "kind": "log", "text": "正在加载 HuBERT…（首次会较慢）    6.0% | 已用 00:01 | 预计剩余 00:20"}
+{"ts": 1768118565.784276, "kind": "log", "text": "正在加载 HuBERT…（首次会较慢）    6.0% | 已用 00:01 | 预计剩余 00:20"}
+{"ts": 1768118566.789651, "kind": "log", "text": "准备进入推理…   20.0% | 已用 00:03 | 预计剩余 00:13"}
+{"ts": 1768118566.791905, "kind": "log", "text": "提取 F0（rmvpe）…   20.0% | 已用 00:03 | 预计剩余 00:13\n提取 F0（rmvpe）…（0/1）"}
+{"ts": 1768118566.8007731, "kind": "log", "text": "推理失败：'rmvpe_root'\n\nTraceback (most recent call last):\n  File \"/Users/cogito/Retrieval-based-Voice-Conversion-WebUI/infer/modules/vc/modules.py\", line 328, in worker\n    audio_opt = self.pipeline.pipeline(\n  File \"/Users/cogito/Retrieval-based-Voice-Conversion-WebUI/infer/modules/vc/pipeline.py\", line 377, in pipeline\n    pitch, pitchf = self.get_f0(\n  File \"/Users/cogito/Retrieval-based-Voice-Conversion-WebUI/infer/modules/vc/pipeline.py\", line 148, in get_f0\n    rmvpe_path = \"%s/rmvpe.pt\" % os.environ[\"rmvpe_root\"]\n  File \"/opt/homebrew/Caskroom/miniconda/base/envs/rvcv2/lib/python3.10/os.py\", line 680, in __getitem__\n    raise KeyError(key) from None\nKeyError: 'rmvpe_root'\n"}
+{"ts": 1768118566.801855, "kind": "status", "status": "succeeded", "progress": 100.0, "resultArtifactId": "ab2c40f43dc34bbb992cf103d3625179"}
+{"ts": 1768118566.8020182, "kind": "artifact", "artifactId": "ab2c40f43dc34bbb992cf103d3625179", "path": "/Users/cogito/Retrieval-based-Voice-Conversion-WebUI/web/server/storage/artifacts/ab2c40f43dc34bbb992cf103d3625179.wav"}
