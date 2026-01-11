@@ -27,3 +27,4 @@ rmvpe.pt
 ffmpeg.*
 ffprobe.*
 src/
+logs/
