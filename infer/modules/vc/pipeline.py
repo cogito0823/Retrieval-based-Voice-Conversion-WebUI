@@ -231,9 +231,14 @@ class Pipeline(object):
             "output_layer": 9 if version == "v1" else 12,
         }
         t0 = ttime()
+        is_mps = self.device == "mps" or str(self.device).startswith("mps")
         with torch.no_grad():
             logits = model.extract_features(**inputs)
             feats = model.final_proj(logits[0]) if version == "v1" else logits[0]
+        # Synchronize MPS after HuBERT feature extraction
+        if is_mps:
+            if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+                torch.mps.synchronize()
         if protect < 0.5 and pitch is not None and pitchf is not None:
             feats0 = feats.clone()
         if (
@@ -241,13 +246,29 @@ class Pipeline(object):
             and not isinstance(big_npy, type(None))
             and index_rate != 0
         ):
-            npy = feats[0].cpu().numpy()
+            if is_mps:
+                if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+                    torch.mps.synchronize()
+                feats_cpu = feats.cpu()
+                npy = feats_cpu[0].numpy()
+            else:
+                npy = feats[0].cpu().numpy()
+            
             if self.is_half:
                 npy = npy.astype("float32")
-
-            # _, I = index.search(npy, 1)
-            # npy = big_npy[I.squeeze()]
-
+            
+            # Ensure npy is C-contiguous float32 for faiss
+            if npy.dtype != np.float32:
+                npy = npy.astype(np.float32)
+            if not npy.flags['C_CONTIGUOUS']:
+                npy = np.ascontiguousarray(npy)
+            
+            # Force MPS synchronization before faiss to avoid any pending GPU operations
+            if is_mps:
+                if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+                    torch.mps.synchronize()
+            
+            # faiss search (note: faiss is set to single-thread in infer_worker.py for macOS)
             score, ix = index.search(npy, k=8)
             weight = np.square(1 / score)
             weight /= weight.sum(axis=1, keepdims=True)
@@ -255,10 +276,20 @@ class Pipeline(object):
 
             if self.is_half:
                 npy = npy.astype("float16")
-            feats = (
-                torch.from_numpy(npy).unsqueeze(0).to(self.device) * index_rate
-                + (1 - index_rate) * feats
-            )
+            
+            if is_mps:
+                # Blend on CPU then transfer back to MPS to avoid MPS/numpy interaction issues
+                npy_tensor = torch.from_numpy(npy).unsqueeze(0)
+                blended = npy_tensor * index_rate + (1 - index_rate) * feats_cpu
+                feats = blended.to(self.device)
+                del feats_cpu, npy_tensor, blended
+                if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+                    torch.mps.synchronize()
+            else:
+                feats = (
+                    torch.from_numpy(npy).unsqueeze(0).to(self.device) * index_rate
+                    + (1 - index_rate) * feats
+                )
 
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
         if protect < 0.5 and pitch is not None and pitchf is not None:
@@ -284,11 +315,20 @@ class Pipeline(object):
         with torch.no_grad():
             hasp = pitch is not None and pitchf is not None
             arg = (feats, p_len, pitch, pitchf, sid) if hasp else (feats, p_len, sid)
-            audio1 = (net_g.infer(*arg)[0][0, 0]).data.cpu().float().numpy()
-            del hasp, arg
+            infer_out = net_g.infer(*arg)[0][0, 0]
+            # Synchronize MPS before CPU transfer
+            if is_mps:
+                if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+                    torch.mps.synchronize()
+            audio1 = infer_out.data.cpu().float().numpy()
+            del hasp, arg, infer_out
         del feats, p_len, padding_mask
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif is_mps:
+            # Clear MPS cache
+            if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                torch.mps.empty_cache()
         t2 = ttime()
         times[0] += t1 - t0
         times[2] += t2 - t1
