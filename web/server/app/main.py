@@ -1,14 +1,19 @@
 import os
+import re
 import sys
 import shutil
 import threading
 import time
 import uuid
 import subprocess
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Queue
 from typing import Any, Literal
+
+import httpx
+from bs4 import BeautifulSoup
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -119,6 +124,47 @@ class InferOptionsResp(BaseModel):
     f0_methods: list[str]
     resample_srs: list[int]
     defaults: InferDefaults
+
+
+# ===================== 在线音乐搜索相关模型 =====================
+
+MUSIC_SEARCH_BASE_URL = "https://www.mvmp3.com"
+
+
+class MusicSearchItem(BaseModel):
+    """搜索结果中的单首歌曲"""
+    song_id: str  # 歌曲唯一标识 (如 1f62c7d9b83059cc879da895e0ad64cf)
+    title: str  # 歌曲名
+    artist: str  # 艺人
+    cover_url: str | None = None  # 封面图 URL
+    duration: str | None = None  # 时长 (如 "04:55")
+    size: str | None = None  # 文件大小 (如 "4.51 MB")
+    language: str | None = None  # 语言
+    detail_url: str  # 详情页 URL
+
+
+class MusicSearchResp(BaseModel):
+    """搜索结果响应"""
+    keyword: str
+    total: int  # 搜索结果总数
+    page: int  # 当前页
+    items: list[MusicSearchItem]
+
+
+class MusicDetailResp(BaseModel):
+    """歌曲详情 (包含下载链接)"""
+    song_id: str
+    title: str
+    artist: str
+    cover_url: str | None = None
+    album: str | None = None
+    download_url: str | None = None  # 实际音频下载链接
+
+
+class UploadFromUrlReq(BaseModel):
+    """从 URL 下载音频的请求"""
+    url: str
+    filename: str | None = None  # 可选的文件名
 
 
 @dataclass
@@ -573,6 +619,185 @@ def _list_indexes() -> list[IndexItem]:
     return items
 
 
+# ===================== 在线音乐搜索辅助函数 =====================
+
+def _get_http_client() -> httpx.Client:
+    """获取 HTTP 客户端，带常用请求头"""
+    return httpx.Client(
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": MUSIC_SEARCH_BASE_URL,
+        },
+        timeout=30.0,
+        follow_redirects=True,
+    )
+
+
+def _parse_search_results(html: str, keyword: str) -> MusicSearchResp:
+    """解析搜索结果页面 HTML"""
+    soup = BeautifulSoup(html, "html.parser")
+    items: list[MusicSearchItem] = []
+
+    # 解析总数
+    total = 0
+    pagedata = soup.select_one(".pagedata span")
+    if pagedata:
+        try:
+            total = int(pagedata.get_text(strip=True))
+        except ValueError:
+            pass
+
+    # 解析歌曲列表
+    play_list = soup.select_one(".play_list ul")
+    if play_list:
+        for li in play_list.find_all("li", recursive=False):
+            try:
+                item = _parse_search_item(li)
+                if item:
+                    items.append(item)
+            except Exception:
+                continue
+
+    return MusicSearchResp(keyword=keyword, total=total, page=1, items=items)
+
+
+def _parse_search_item(li) -> MusicSearchItem | None:
+    """解析单个搜索结果项"""
+    # 获取详情页链接和 song_id
+    link_tag = li.select_one(".list_r .name a.url")
+    if not link_tag:
+        return None
+
+    href = link_tag.get("href", "")
+    # /mp3/1f62c7d9b83059cc879da895e0ad64cf.html -> 1f62c7d9b83059cc879da895e0ad64cf
+    match = re.search(r"/mp3/([a-f0-9]+)\.html", href)
+    if not match:
+        return None
+    song_id = match.group(1)
+
+    # 解析歌名和艺人
+    raw_text = link_tag.get_text(strip=True)
+    # 格式通常是 "艺人 - 歌名" 或纯歌名
+    if " - " in raw_text:
+        parts = raw_text.split(" - ", 1)
+        artist = parts[0].strip()
+        title = parts[1].strip()
+    else:
+        artist = ""
+        title = raw_text
+
+    # 封面图
+    cover_url = None
+    img_tag = li.select_one(".pic img")
+    if img_tag:
+        cover_url = img_tag.get("src")
+
+    # 时长
+    duration = None
+    stime_tag = li.select_one(".stime")
+    if stime_tag:
+        duration = stime_tag.get_text(strip=True)
+
+    # 大小和语言
+    size = None
+    language = None
+    p_tag = li.select_one(".list_r p")
+    if p_tag:
+        spans = p_tag.find_all("span")
+        for span in spans:
+            text = span.get_text(strip=True)
+            if text.startswith("语言:"):
+                language = text.replace("语言:", "").strip()
+            elif "MB" in text or "大小:" in text:
+                size = text.replace("大小:", "").strip()
+
+    return MusicSearchItem(
+        song_id=song_id,
+        title=title,
+        artist=artist,
+        cover_url=cover_url,
+        duration=duration,
+        size=size,
+        language=language,
+        detail_url=f"{MUSIC_SEARCH_BASE_URL}{href}",
+    )
+
+
+def _parse_detail_page(html: str, song_id: str) -> MusicDetailResp:
+    """解析歌曲详情页面，提取下载链接"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 解析标题 (格式: "艺人 - 歌名")
+    title = ""
+    artist = ""
+    djname = soup.select_one(".djname")
+    if djname:
+        raw = djname.get_text(strip=True)
+        if " - " in raw:
+            parts = raw.split(" - ", 1)
+            artist = parts[0].strip()
+            title = parts[1].strip()
+        else:
+            title = raw
+
+    # 封面图 (从 og:image meta 标签)
+    cover_url = None
+    og_image = soup.select_one('meta[property="og:image"]')
+    if og_image:
+        cover_url = og_image.get("content")
+
+    # 专辑
+    album = None
+    popup_body = soup.select_one(".popup-body")
+    if popup_body:
+        for li in popup_body.find_all("li"):
+            text = li.get_text(strip=True)
+            if text.startswith("所属专辑："):
+                album_link = li.select_one("a")
+                if album_link:
+                    album = album_link.get_text(strip=True)
+
+    return MusicDetailResp(
+        song_id=song_id,
+        title=title,
+        artist=artist,
+        cover_url=cover_url,
+        album=album,
+        download_url=None,  # 下载链接需要单独获取
+    )
+
+
+def _fetch_download_url(song_id: str) -> str | None:
+    """
+    获取歌曲的实际下载链接。
+    通过请求 /style/js/play.php API 获取 mp3 URL。
+    """
+    try:
+        with httpx.Client(
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Referer": f"{MUSIC_SEARCH_BASE_URL}/mp3/{song_id}.html",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            },
+            timeout=30.0,
+        ) as client:
+            # 请求播放器 API 获取音频链接
+            play_url = f"{MUSIC_SEARCH_BASE_URL}/style/js/play.php"
+            resp = client.post(play_url, data={"id": song_id, "type": "dance"})
+            resp.raise_for_status()
+            
+            data = resp.json()
+            if data.get("msg") == 1 and data.get("url"):
+                return data["url"]
+
+    except Exception as e:
+        print(f"获取下载链接失败: {e}")
+    return None
+
+
 _ensure_dirs()
 task_manager = TaskManager()
 
@@ -710,6 +935,21 @@ def upload_f0(file: UploadFile = File(...)) -> UploadResp:
     return UploadResp(uploadId=upload_id, filename=filename)
 
 
+@app.get("/api/uploads/{upload_id}/file")
+def get_upload_file(upload_id: str, request: Request):
+    """获取上传的文件用于播放预览"""
+    path = _resolve_upload_path(upload_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="upload not found")
+    media_type = _get_media_type(path)
+    return FileResponse(
+        path=str(path),
+        filename=path.name,
+        media_type=media_type,
+        headers={"Accept-Ranges": "bytes"},
+    )
+
+
 @app.post("/api/tasks/infer-offline", response_model=CreateTaskResp)
 def create_infer_offline(req: CreateInferOfflineReq) -> CreateTaskResp:
     # Validate model exists
@@ -779,4 +1019,141 @@ def download_artifact(artifact_id: str, request: Request):
         media_type=media_type,
         headers={"Accept-Ranges": "bytes"},
     )
+
+
+# ===================== 在线音乐搜索 API =====================
+
+@app.get("/api/music/search", response_model=MusicSearchResp)
+def search_music(keyword: str, page: int = 1) -> MusicSearchResp:
+    """
+    搜索在线音乐。
+    - keyword: 搜索关键词
+    - page: 页码 (默认 1)
+    """
+    if not keyword or not keyword.strip():
+        raise HTTPException(status_code=400, detail="keyword is required")
+
+    keyword = keyword.strip()
+    encoded_keyword = urllib.parse.quote(keyword)
+
+    try:
+        with _get_http_client() as client:
+            if page == 1:
+                url = f"{MUSIC_SEARCH_BASE_URL}/so/{encoded_keyword}.html"
+            else:
+                url = f"{MUSIC_SEARCH_BASE_URL}/so.php?wd={encoded_keyword}&page={page}"
+
+            resp = client.get(url)
+            resp.raise_for_status()
+            html = resp.text
+
+            result = _parse_search_results(html, keyword)
+            result.page = page
+            return result
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"搜索请求失败: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"搜索解析失败: {e}")
+
+
+@app.get("/api/music/detail/{song_id}", response_model=MusicDetailResp)
+def get_music_detail(song_id: str) -> MusicDetailResp:
+    """
+    获取歌曲详情，包括下载链接。
+    - song_id: 歌曲 ID (如 1f62c7d9b83059cc879da895e0ad64cf)
+    """
+    if not song_id or not re.match(r'^[a-f0-9]+$', song_id):
+        raise HTTPException(status_code=400, detail="invalid song_id")
+
+    try:
+        with _get_http_client() as client:
+            # 获取详情页
+            detail_url = f"{MUSIC_SEARCH_BASE_URL}/mp3/{song_id}.html"
+            resp = client.get(detail_url)
+            resp.raise_for_status()
+            html = resp.text
+
+            result = _parse_detail_page(html, song_id)
+
+            # 获取下载链接
+            download_url = _fetch_download_url(song_id)
+            result.download_url = download_url
+
+            return result
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"获取详情失败: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"解析详情失败: {e}")
+
+
+@app.post("/api/uploads/audio-from-url", response_model=UploadResp)
+def upload_audio_from_url(req: UploadFromUrlReq) -> UploadResp:
+    """
+    从 URL 下载音频文件并保存为上传文件。
+    可用于将在线搜索的音乐作为推理输入。
+    """
+    url = req.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    # 基本的 URL 验证
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="invalid url scheme")
+
+    try:
+        # 使用特定的 headers 绕过防盗链
+        parsed = urllib.parse.urlparse(url)
+        referer = f"{parsed.scheme}://{parsed.netloc}/"
+        
+        with httpx.Client(
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "*/*",
+                "Referer": referer,
+                "Origin": referer.rstrip("/"),
+            },
+            timeout=60.0,
+            follow_redirects=True,
+        ) as client:
+            # 下载音频
+            resp = client.get(url)
+            resp.raise_for_status()
+
+            # 确定文件名
+            if req.filename:
+                filename = _safe_filename(req.filename)
+            else:
+                # 尝试从 URL 或 Content-Disposition 获取文件名
+                content_disp = resp.headers.get("content-disposition", "")
+                if "filename=" in content_disp:
+                    match = re.search(r'filename[*]?=["\']?([^"\';\s]+)', content_disp)
+                    if match:
+                        filename = _safe_filename(match.group(1))
+                    else:
+                        filename = "audio.mp3"
+                else:
+                    # 从 URL 路径提取
+                    parsed = urllib.parse.urlparse(url)
+                    path_name = os.path.basename(parsed.path)
+                    if path_name and "." in path_name:
+                        filename = _safe_filename(path_name)
+                    else:
+                        filename = "audio.mp3"
+
+            # 确保有正确的扩展名
+            if not any(filename.lower().endswith(ext) for ext in [".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac"]):
+                filename += ".mp3"
+
+            # 保存文件
+            upload_id = _uuid()
+            out_path = UPLOADS_DIR / f"{upload_id}_{filename}"
+            with out_path.open("wb") as f:
+                f.write(resp.content)
+
+            return UploadResp(uploadId=upload_id, filename=filename)
+
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"下载音频失败: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"保存音频失败: {e}")
 
