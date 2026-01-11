@@ -2,6 +2,8 @@ import os
 import sys
 import logging
 import time
+import json
+import traceback
 from torch.profiler import profile, record_function, ProfilerActivity
 from contextlib import nullcontext
 from multiprocessing import cpu_count
@@ -121,6 +123,43 @@ class EpochRecorder:
         elapsed_time_str = str(datetime.timedelta(seconds=elapsed_time))
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return f"[{current_time}] | ({elapsed_time_str})"
+
+
+class TrainEventWriter:
+    """
+    Best-effort JSONL writer for WebUI progress/ETA.
+    Writes one JSON object per line to <model_dir>/train_events.jsonl
+    """
+
+    def __init__(self, model_dir: str, enabled: bool = True):
+        self.enabled = enabled
+        self.path = os.path.join(model_dir, "train_events.jsonl")
+        self._fh = None
+        if not self.enabled:
+            return
+        try:
+            os.makedirs(model_dir, exist_ok=True)
+            # line-buffered text mode
+            self._fh = open(self.path, "a", encoding="utf-8", buffering=1)
+        except Exception:
+            self.enabled = False
+            self._fh = None
+
+    def write(self, event: dict):
+        if not self.enabled or self._fh is None:
+            return
+        try:
+            self._fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            # never block training due to monitoring
+            self.enabled = False
+
+    def close(self):
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except Exception:
+            pass
 
 
 def main():
@@ -338,40 +377,93 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
 
     scaler = GradScaler(enabled=hps.train.fp16_run)
 
+    event_writer = None
+    if rank == 0:
+        event_writer = TrainEventWriter(hps.model_dir, enabled=True)
+        event_writer.write(
+            {
+                "type": "train_start",
+                "ts": time.time(),
+                "pid": os.getpid(),
+                "exp_dir": hps.model_dir,
+                "device": str(device),
+                "device_type": device.type,
+                "amp": bool(hps.train.fp16_run),
+                "batch_size": int(hps.train.batch_size),
+                "total_epoch": int(hps.total_epoch),
+                "save_every_epoch": int(hps.save_every_epoch),
+                "log_interval": int(hps.train.log_interval),
+                "if_latest": int(hps.if_latest),
+                "if_cache_data_in_gpu": int(hps.if_cache_data_in_gpu),
+                "save_every_weights": str(hps.save_every_weights),
+                "gpus": str(hps.gpus),
+                "pretrainG": str(getattr(hps, "pretrainG", "")),
+                "pretrainD": str(getattr(hps, "pretrainD", "")),
+                "steps_per_epoch": int(len(train_loader)),
+                "version": str(hps.version),
+                "if_f0": int(hps.if_f0),
+            }
+        )
+
     cache = []
-    for epoch in range(epoch_str, hps.train.epochs + 1):
-        if rank == 0:
-            done = train_and_evaluate(
-                rank,
-                epoch,
-                hps,
-                [net_g, net_d],
-                [optim_g, optim_d],
-                [scheduler_g, scheduler_d],
-                scaler,
-                [train_loader, None],
-                logger,
-                [writer, writer_eval],
-                cache,
+    try:
+        for epoch in range(epoch_str, hps.train.epochs + 1):
+            if rank == 0:
+                done = train_and_evaluate(
+                    rank,
+                    epoch,
+                    hps,
+                    [net_g, net_d],
+                    [optim_g, optim_d],
+                    [scheduler_g, scheduler_d],
+                    scaler,
+                    [train_loader, None],
+                    logger,
+                    [writer, writer_eval],
+                    cache,
+                    event_writer=event_writer,
+                )
+            else:
+                done = train_and_evaluate(
+                    rank,
+                    epoch,
+                    hps,
+                    [net_g, net_d],
+                    [optim_g, optim_d],
+                    [scheduler_g, scheduler_d],
+                    scaler,
+                    [train_loader, None],
+                    None,
+                    None,
+                    cache,
+                    event_writer=None,
+                )
+            if done:
+                break
+            scheduler_g.step()
+            scheduler_d.step()
+    except Exception:
+        if rank == 0 and event_writer is not None:
+            event_writer.write(
+                {
+                    "type": "error",
+                    "ts": time.time(),
+                    "epoch": int(epoch_str),
+                    "global_step": int(global_step),
+                    "traceback": traceback.format_exc(),
+                }
             )
-        else:
-            done = train_and_evaluate(
-                rank,
-                epoch,
-                hps,
-                [net_g, net_d],
-                [optim_g, optim_d],
-                [scheduler_g, scheduler_d],
-                scaler,
-                [train_loader, None],
-                None,
-                None,
-                cache,
+        raise
+    finally:
+        if rank == 0 and event_writer is not None:
+            event_writer.write(
+                {
+                    "type": "train_end",
+                    "ts": time.time(),
+                    "global_step": int(global_step),
+                }
             )
-        if done:
-            break
-        scheduler_g.step()
-        scheduler_d.step()
+            event_writer.close()
     if use_dist:
         try:
             dist.destroy_process_group()
@@ -381,6 +473,7 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
 
 def train_and_evaluate(
     rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, cache
+    , event_writer: TrainEventWriter | None = None
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
@@ -483,6 +576,19 @@ def train_and_evaluate(
 
     # Run steps
     epoch_recorder = EpochRecorder()
+    if rank == 0 and event_writer is not None:
+        try:
+            event_writer.write(
+                {
+                    "type": "epoch_start",
+                    "ts": time.time(),
+                    "epoch": int(epoch),
+                    "total_epoch": int(hps.total_epoch),
+                    "global_step": int(global_step),
+                }
+            )
+        except Exception:
+            pass
     for batch_idx, info in data_iterator:
         # Data
         ## Unpack
@@ -593,6 +699,39 @@ def train_and_evaluate(
         t_end = ttime()
 
         if rank == 0:
+            if event_writer is not None:
+                # Always emit step timing event (cheap; stable ETA / stall detection)
+                step_event = {
+                    "type": "step_end",
+                    "ts": time.time(),
+                    "epoch": int(epoch),
+                    "total_epoch": int(hps.total_epoch),
+                    "batch_idx": int(batch_idx),
+                    "steps_per_epoch": int(len(train_loader)),
+                    "global_step": int(global_step),
+                    "step_time_total": float(t_end - t_start),
+                    "step_time_forward": float(t_mid - t_start),
+                    "step_time_backward": float(t_end - t_mid),
+                    "lr": float(optim_g.param_groups[0]["lr"]),
+                }
+                # Only attach heavier metrics at log_interval to avoid device->CPU sync every step
+                if global_step % hps.train.log_interval == 0:
+                    step_event.update(
+                        {
+                            "loss_disc": float(loss_disc.detach().cpu().item()),
+                            "loss_gen": float(loss_gen.detach().cpu().item()),
+                            "loss_fm": float(loss_fm.detach().cpu().item()),
+                            "loss_mel": float(loss_mel.detach().cpu().item()),
+                            "loss_kl": float(loss_kl.detach().cpu().item()),
+                            "grad_norm_d": float(grad_norm_d.detach().cpu().item())
+                            if torch.is_tensor(grad_norm_d)
+                            else float(grad_norm_d),
+                            "grad_norm_g": float(grad_norm_g.detach().cpu().item())
+                            if torch.is_tensor(grad_norm_g)
+                            else float(grad_norm_g),
+                        }
+                    )
+                event_writer.write(step_event)
             if global_step % hps.train.log_interval == 0:
                 logger.info(f"Step Time: Total={t_end-t_start:.3f}s | Forward={(t_mid-t_start):.3f}s | Backward={(t_end-t_mid):.3f}s")
                 lr = optim_g.param_groups[0]["lr"]
@@ -671,6 +810,17 @@ def train_and_evaluate(
                 epoch,
                 os.path.join(hps.model_dir, "D_{}.pth".format(global_step)),
             )
+            if event_writer is not None:
+                event_writer.write(
+                    {
+                        "type": "checkpoint_saved",
+                        "ts": time.time(),
+                        "epoch": int(epoch),
+                        "global_step": int(global_step),
+                        "g_path": os.path.join(hps.model_dir, "G_{}.pth".format(global_step)),
+                        "d_path": os.path.join(hps.model_dir, "D_{}.pth".format(global_step)),
+                    }
+                )
         else:
             utils.save_checkpoint(
                 net_g,
@@ -686,6 +836,17 @@ def train_and_evaluate(
                 epoch,
                 os.path.join(hps.model_dir, "D_{}.pth".format(2333333)),
             )
+            if event_writer is not None:
+                event_writer.write(
+                    {
+                        "type": "checkpoint_saved",
+                        "ts": time.time(),
+                        "epoch": int(epoch),
+                        "global_step": int(global_step),
+                        "g_path": os.path.join(hps.model_dir, "G_{}.pth".format(2333333)),
+                        "d_path": os.path.join(hps.model_dir, "D_{}.pth".format(2333333)),
+                    }
+                )
         if rank == 0 and hps.save_every_weights == "1":
             if hasattr(net_g, "module"):
                 ckpt = net_g.module.state_dict()
@@ -710,6 +871,16 @@ def train_and_evaluate(
 
     if rank == 0:
         logger.info("====> Epoch: {} {}".format(epoch, epoch_recorder.record()))
+        if event_writer is not None:
+            event_writer.write(
+                {
+                    "type": "epoch_end",
+                    "ts": time.time(),
+                    "epoch": int(epoch),
+                    "total_epoch": int(hps.total_epoch),
+                    "global_step": int(global_step),
+                }
+            )
     # Graceful stop (avoid os._exit which leaks multiprocessing resources on macOS)
     if epoch >= hps.total_epoch:
         if rank == 0:

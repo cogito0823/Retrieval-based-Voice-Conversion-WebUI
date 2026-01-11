@@ -29,8 +29,10 @@ import gradio as gr
 import fairseq
 import pathlib
 import json
+import time
 from time import sleep
 from subprocess import Popen
+import subprocess
 from random import shuffle
 import warnings
 import traceback
@@ -41,6 +43,8 @@ import faulthandler
 import signal
 import re
 import datetime
+from collections import deque
+import ast
 
 
 logging.getLogger("numba").setLevel(logging.WARNING)
@@ -90,6 +94,157 @@ os.makedirs(os.path.join(now_dir, "assets/weights"), exist_ok=True)
 os.environ["TEMP"] = tmp
 warnings.filterwarnings("ignore")
 torch.manual_seed(114514)
+
+# Training process control (best-effort, single active training assumed)
+_TRAIN_PROC: dict[str, object] = {
+    "p": None,  # subprocess.Popen
+    "exp": None,
+    "paused": False,
+}
+
+
+def _set_train_proc(p, exp_name: str):
+    _TRAIN_PROC["p"] = p
+    _TRAIN_PROC["exp"] = exp_name
+    _TRAIN_PROC["paused"] = False
+
+
+def _clear_train_proc():
+    _TRAIN_PROC["p"] = None
+    _TRAIN_PROC["exp"] = None
+    _TRAIN_PROC["paused"] = False
+
+
+def _signal_train_proc(sig: int) -> tuple[bool, str]:
+    """
+    Send signal to current training process (and its group on POSIX).
+    """
+    p = _TRAIN_PROC.get("p")
+    if p is None:
+        return False, "当前没有正在运行的训练进程。"
+    try:
+        rc = p.poll()
+        if rc is not None:
+            _clear_train_proc()
+            return False, f"训练进程已结束（exit code={rc}）。"
+    except Exception:
+        pass
+
+    try:
+        if platform.system() != "Windows":
+            # If started as a new session, pid is the process group leader
+            os.killpg(p.pid, sig)
+        else:
+            # Windows: best-effort
+            os.kill(p.pid, sig)
+        return True, "OK"
+    except Exception as e:
+        return False, f"发送信号失败：{e}"
+
+
+def pause_training_ui() -> str:
+    if _TRAIN_PROC.get("paused"):
+        return "当前已暂停。"
+    ok, msg = _signal_train_proc(signal.SIGSTOP if hasattr(signal, "SIGSTOP") else signal.SIGTERM)
+    if ok and hasattr(signal, "SIGSTOP"):
+        _TRAIN_PROC["paused"] = True
+        return "已暂停训练（SIGSTOP）。"
+    return f"暂停失败：{msg}"
+
+
+def resume_training_ui() -> str:
+    if not _TRAIN_PROC.get("paused"):
+        return "当前未处于暂停状态。"
+    ok, msg = _signal_train_proc(signal.SIGCONT if hasattr(signal, "SIGCONT") else signal.SIGTERM)
+    if ok and hasattr(signal, "SIGCONT"):
+        _TRAIN_PROC["paused"] = False
+        return "已继续训练（SIGCONT）。"
+    return f"继续失败：{msg}"
+
+
+def stop_training_ui() -> str:
+    # Graceful stop: TERM -> KILL fallback
+    if _TRAIN_PROC.get("p") is None:
+        return "当前没有正在运行的训练进程。"
+    ok, msg = _signal_train_proc(signal.SIGTERM)
+    if ok:
+        return "已发送停止信号（SIGTERM）。"
+    return f"停止失败：{msg}"
+
+
+def get_train_runtime_status_ui(exp_name: str = "") -> str:
+    """
+    Show whether training is running (WebUI-launched or any system process).
+    """
+    exp_name = (exp_name or "").strip()
+    lines: list[str] = []
+
+    # WebUI-launched process
+    p = _TRAIN_PROC.get("p")
+    if p is not None:
+        try:
+            rc = p.poll()
+            if rc is None:
+                exists, cmd = _probe_pid(int(p.pid))
+                ok_train = exists and _is_train_cmd(cmd, str(_TRAIN_PROC.get("exp") or "") or None)
+                lines.append(
+                    f"WebUI 训练进程：运行中 pid={p.pid} exp={_TRAIN_PROC.get('exp')} paused={_TRAIN_PROC.get('paused')}"
+                )
+                if exists:
+                    lines.append(f"  cmd: {cmd}")
+                else:
+                    lines.append("  注意：pid 不存在（可能已退出）。")
+                if exists and not ok_train:
+                    lines.append("  注意：该 pid 不是训练进程（cmd 不匹配）。")
+            else:
+                lines.append(f"WebUI 训练进程：已结束 exit code={rc}")
+        except Exception as e:
+            lines.append(f"WebUI 训练进程：状态获取失败：{e}")
+    else:
+        lines.append("WebUI 训练进程：无")
+
+    # Latest train_start pid from events (per exp)
+    if exp_name:
+        try:
+            events_path = os.path.join(now_dir, "logs", exp_name, "train_events.jsonl")
+            evs = _tail_jsonl_file(events_path, max_chars=200000)
+            last_start = None
+            for ev in reversed(evs):
+                if isinstance(ev, dict) and ev.get("type") == "train_start":
+                    last_start = ev
+                    break
+            if last_start and last_start.get("pid") is not None:
+                pid = int(last_start["pid"])
+                exists, cmd = _probe_pid(pid)
+                if exists and _is_train_cmd(cmd, exp_name):
+                    lines.append(f"最近一次训练 pid={pid}：运行中（命令匹配）")
+                elif exists:
+                    lines.append(f"最近一次训练 pid={pid}：pid 存在但不是训练进程（命令不匹配）")
+                    lines.append(f"  cmd: {cmd}")
+                else:
+                    lines.append(f"最近一次训练 pid={pid}：未运行（进程不存在/已结束）")
+            else:
+                lines.append("最近一次训练：未发现 train_start 事件。")
+        except Exception as e:
+            lines.append(f"最近一次训练：读取事件失败：{e}")
+
+    # System scan (best-effort)
+    try:
+        out = subprocess.check_output(["ps", "aux"], text=True)
+        proc_lines = [l for l in out.splitlines() if "infer/modules/train/train.py" in l]
+        if exp_name:
+            proc_lines = [l for l in proc_lines if f" -e {exp_name} " in l or l.endswith(f" -e {exp_name}")]
+        if proc_lines:
+            lines.append("系统检测到训练进程：")
+            lines.extend(proc_lines[:5])
+            if len(proc_lines) > 5:
+                lines.append(f"...（共 {len(proc_lines)} 条，已截断）")
+        else:
+            lines.append("系统检测：未发现训练进程。")
+    except Exception as e:
+        lines.append(f"系统检测失败：{e}")
+
+    return "\n".join(lines)
 
 
 config = Config()
@@ -284,6 +439,858 @@ def tail_text_file(path: str, max_chars: int = 12000) -> str:
         return traceback.format_exc()
 
 
+def _safe_list_log_experiments() -> list[str]:
+    """
+    List experiment folders under ./logs (best-effort).
+    """
+    try:
+        base = os.path.join(now_dir, "logs")
+        if not os.path.isdir(base):
+            return []
+        exps = []
+        for name in os.listdir(base):
+            if name.startswith("."):
+                continue
+            p = os.path.join(base, name)
+            if os.path.isdir(p):
+                exps.append(name)
+        exps.sort()
+        return exps
+    except Exception:
+        return []
+
+
+def _exp_meta_path(exp_name: str) -> str:
+    return os.path.join(now_dir, "logs", exp_name, "meta.json")
+
+
+def _write_exp_meta(exp_name: str, trainset_dir: str | None = None):
+    try:
+        if not exp_name:
+            return
+        p = _exp_meta_path(exp_name)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        meta = {}
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    meta = json.load(f) or {}
+            except Exception:
+                meta = {}
+        meta.setdefault("created_at", time.time())
+        meta["updated_at"] = time.time()
+        if trainset_dir:
+            meta["trainset_dir"] = trainset_dir
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except Exception:
+        pass
+
+
+def _guess_trainset_dir_from_preprocess_log(exp_name: str) -> str:
+    """
+    Best-effort heuristic:
+    - Read logs/<exp>/preprocess.log lines like "<file>\t-> Success"
+    - Compute common path prefix; return directory.
+    """
+    try:
+        p = os.path.join(now_dir, "logs", exp_name, "preprocess.log")
+        if not os.path.exists(p):
+            return ""
+        files = []
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if "\t->" in line:
+                    fp = line.split("\t->", 1)[0].strip()
+                    if fp:
+                        files.append(fp)
+        if not files:
+            return ""
+        common = os.path.commonpath(files)
+        if os.path.isfile(common):
+            common = os.path.dirname(common)
+        if os.path.isdir(common):
+            return common
+        # fallback: dirname of first file
+        return os.path.dirname(files[0])
+    except Exception:
+        return ""
+
+
+def _load_exp_settings(exp_name: str) -> tuple[str, str, str, bool, str]:
+    """
+    Returns: (exp_name, trainset_dir, sr2, if_f0, version)
+    """
+    exp_name = (exp_name or "").strip()
+    if not exp_name:
+        return "", "", "40k", True, "v2"
+
+    # defaults
+    trainset_dir = ""
+    sr2 = "40k"
+    if_f0 = True
+    version = "v2"
+
+    # 1) meta.json
+    try:
+        mp = _exp_meta_path(exp_name)
+        if os.path.exists(mp):
+            with open(mp, "r", encoding="utf-8") as f:
+                meta = json.load(f) or {}
+            trainset_dir = str(meta.get("trainset_dir", "")).strip()
+    except Exception:
+        pass
+
+    # 2) train.log first line (contains hps dict, usually includes sample_rate/version/if_f0)
+    try:
+        tl = os.path.join(now_dir, "logs", exp_name, "train.log")
+        if os.path.exists(tl):
+            with open(tl, "r", encoding="utf-8", errors="replace") as f:
+                first = f.readline().strip()
+            if "\tINFO\t" in first:
+                payload = first.split("\tINFO\t", 1)[1].strip()
+                data = ast.literal_eval(payload)
+                if isinstance(data, dict):
+                    sr2 = str(data.get("sample_rate", sr2))
+                    version = str(data.get("version", version))
+                    if_f0 = bool(int(data.get("if_f0", 1)))
+    except Exception:
+        pass
+
+    # 3) infer version from feature folder if missing
+    try:
+        exp_dir = os.path.join(now_dir, "logs", exp_name)
+        if os.path.isdir(os.path.join(exp_dir, "3_feature256")):
+            version = "v1"
+        elif os.path.isdir(os.path.join(exp_dir, "3_feature768")):
+            version = "v2"
+        if os.path.isdir(os.path.join(exp_dir, "2a_f0")) and os.path.isdir(
+            os.path.join(exp_dir, "2b-f0nsf")
+        ):
+            if_f0 = True
+    except Exception:
+        pass
+
+    # 4) preprocess.log heuristic if trainset_dir still unknown
+    if not trainset_dir:
+        trainset_dir = _guess_trainset_dir_from_preprocess_log(exp_name)
+
+    # sanitize
+    if sr2 not in ("32k", "40k", "48k"):
+        # map by sampling rate numbers if any
+        if "48000" in sr2:
+            sr2 = "48k"
+        elif "40000" in sr2:
+            sr2 = "40k"
+        elif "32000" in sr2:
+            sr2 = "32k"
+        else:
+            sr2 = "40k"
+
+    if version not in ("v1", "v2"):
+        version = "v2"
+
+    if version == "v1" and sr2 == "32k":
+        sr2 = "40k"
+
+    return exp_name, trainset_dir, sr2, if_f0, version
+
+
+def _apply_exp_selection(exp_name: str):
+    exp_name, trainset_dir, sr2_val, if_f0_val, version_val = _load_exp_settings(exp_name)
+    # Update pretrained defaults to match selection
+    path_str = "" if version_val == "v1" else "_v2"
+    f0_str = "f0" if if_f0_val else ""
+    pg, pd = get_pretrained_models(path_str, f0_str, sr2_val)
+
+    exp_dir = os.path.join(now_dir, "logs", exp_name)
+
+    # Preprocess / feature extraction snapshots
+    preprocess_log = os.path.join(exp_dir, "preprocess.log")
+    extract_log = os.path.join(exp_dir, "extract_f0_feature.log")
+    preprocess_tail = tail_text_file(preprocess_log, max_chars=4000) if os.path.exists(preprocess_log) else ""
+    extract_tail = tail_text_file(extract_log, max_chars=6000) if os.path.exists(extract_log) else ""
+
+    # Summaries based on artifact folders (cheap)
+    def _count_children(p: str) -> int:
+        try:
+            if not os.path.isdir(p):
+                return 0
+            return len([x for x in os.listdir(p) if not x.startswith(".")])
+        except Exception:
+            return 0
+
+    gt_cnt = _count_children(os.path.join(exp_dir, "0_gt_wavs"))
+    wav16_cnt = _count_children(os.path.join(exp_dir, "1_16k_wavs"))
+    f0_cnt = _count_children(os.path.join(exp_dir, "2a_f0"))
+    f0nsf_cnt = _count_children(os.path.join(exp_dir, "2b-f0nsf"))
+    fea_dir = "3_feature256" if version_val == "v1" else "3_feature768"
+    fea_cnt = _count_children(os.path.join(exp_dir, fea_dir))
+
+    preprocess_info = (
+        f"[{exp_name}] preprocess: 0_gt_wavs={gt_cnt}, 1_16k_wavs={wav16_cnt}\n"
+        + (preprocess_tail.strip() or "（无 preprocess.log）")
+    )
+    extract_info = (
+        f"[{exp_name}] feature: {fea_dir}={fea_cnt}, 2a_f0={f0_cnt}, 2b-f0nsf={f0nsf_cnt}\n"
+        + (extract_tail.strip() or "（无 extract_f0_feature.log）")
+    )
+
+    # Training snapshot from events/log tail
+    train_log_path = os.path.join(exp_dir, "train.log")
+    train_log_tail = tail_text_file(train_log_path, max_chars=12000) if os.path.exists(train_log_path) else ""
+    events_path = os.path.join(exp_dir, "train_events.jsonl")
+
+    # Load hparams snapshot from the latest train_start event (preferred),
+    # or fallback to the latest INFO-hps line in train.log (NOT the first line).
+    save_every_epoch = None
+    total_epoch = None
+    batch_size = None
+    log_interval = None
+    if_latest = None
+    if_cache = None
+    save_every_weights = None
+    gpus = None
+    pretrainG = None
+    pretrainD = None
+    # 0) latest train_start event from JSONL
+    try:
+        evs = _tail_jsonl_file(events_path)
+        for ev in reversed(evs):
+            if isinstance(ev, dict) and ev.get("type") == "train_start":
+                save_every_epoch = ev.get("save_every_epoch")
+                total_epoch = ev.get("total_epoch")
+                batch_size = ev.get("batch_size")
+                log_interval = ev.get("log_interval")
+                if_latest = ev.get("if_latest")
+                if_cache = ev.get("if_cache_data_in_gpu")
+                save_every_weights = ev.get("save_every_weights")
+                gpus = ev.get("gpus")
+                pretrainG = ev.get("pretrainG")
+                pretrainD = ev.get("pretrainD")
+                break
+    except Exception:
+        pass
+    # 1) fallback: latest INFO-hps dict line from train.log
+    if total_epoch is None and os.path.exists(train_log_path):
+        try:
+            with open(train_log_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+            last_payload = None
+            for line in reversed(lines[-500:]):
+                if "\tINFO\t{" in line:
+                    last_payload = line.split("\tINFO\t", 1)[1].strip()
+                    break
+            if last_payload:
+                data = ast.literal_eval(last_payload)
+                if isinstance(data, dict):
+                    save_every_epoch = data.get("save_every_epoch")
+                    total_epoch = data.get("total_epoch")
+                    gpus = data.get("gpus")
+                    if_latest = data.get("if_latest")
+                    if_cache = data.get("if_cache_data_in_gpu")
+                    save_every_weights = data.get("save_every_weights")
+                    pretrainG = data.get("pretrainG")
+                    pretrainD = data.get("pretrainD")
+                    tr = data.get("train") or {}
+                    if isinstance(tr, dict):
+                        batch_size = tr.get("batch_size")
+                        log_interval = tr.get("log_interval")
+        except Exception:
+            pass
+
+    def _u_int(v, default=None):
+        try:
+            if v is None:
+                return default
+            return int(v)
+        except Exception:
+            return default
+
+    save_every_epoch_u = _u_int(save_every_epoch)
+    total_epoch_u = _u_int(total_epoch)
+    batch_size_u = _u_int(batch_size)
+    log_interval_u = _u_int(log_interval)
+    if_latest_u = _u_int(if_latest)
+    if_cache_u = _u_int(if_cache)
+    save_every_weights_u = _u_int(save_every_weights)
+
+    # Build UI updates for training controls (only update when we have values)
+    save_epoch_update = {"__type__": "update"}
+    total_epoch_update = {"__type__": "update"}
+    batch_size_update = {"__type__": "update"}
+    log_interval_update = {"__type__": "update"}
+    if_latest_update = {"__type__": "update"}
+    if_cache_update = {"__type__": "update"}
+    save_weights_update = {"__type__": "update"}
+    gpus_update = {"__type__": "update"}
+    pg_update = pg
+    pd_update = pd
+
+    if save_every_epoch_u is not None:
+        save_epoch_update = {"__type__": "update", "value": save_every_epoch_u}
+    if total_epoch_u is not None:
+        total_epoch_update = {"__type__": "update", "value": total_epoch_u}
+    if batch_size_u is not None:
+        batch_size_update = {"__type__": "update", "value": batch_size_u}
+    if log_interval_u is not None:
+        log_interval_update = {"__type__": "update", "value": log_interval_u}
+    if if_latest_u is not None:
+        if_latest_update = {"__type__": "update", "value": i18n("是") if if_latest_u == 1 else i18n("否")}
+    if if_cache_u is not None:
+        if_cache_update = {"__type__": "update", "value": i18n("是") if if_cache_u == 1 else i18n("否")}
+    if save_every_weights_u is not None:
+        save_weights_update = {"__type__": "update", "value": i18n("是") if save_every_weights_u == 1 else i18n("否")}
+    if gpus:
+        gpus_update = {"__type__": "update", "value": str(gpus)}
+    if pretrainG:
+        pg_update = str(pretrainG)
+    if pretrainD:
+        pd_update = str(pretrainD)
+
+    # Determine total_epoch from config.json if possible (for correct %)
+    total_epoch_int = 0
+    try:
+        cfg_path = os.path.join(exp_dir, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f) or {}
+            total_epoch_int = int(cfg.get("train", {}).get("epochs", 0))  # fallback, not used for training stop
+            # Prefer UI total_epoch semantics stored in hps in train.log if present
+    except Exception:
+        total_epoch_int = 0
+
+    # Build monitor snapshot
+    try:
+        monitor = TrainMonitor(total_epoch=0, avg_window=50)
+        evs = _tail_jsonl_file(events_path)
+        if evs:
+            monitor.update(evs)
+        rendered = monitor.render(stall_threshold_sec=60)
+        state_str = str(rendered.get("state") or i18n("未开始"))
+
+        # PID-based reality check: if last train_start pid is not running, clearly mark as NOT running
+        last_pid = None
+        for ev in reversed(evs or []):
+            if isinstance(ev, dict) and ev.get("type") == "train_start" and ev.get("pid") is not None:
+                try:
+                    last_pid = int(ev.get("pid"))
+                except Exception:
+                    last_pid = None
+                break
+        if last_pid is not None:
+            exists, cmd = _probe_pid(last_pid)
+            is_train = exists and _is_train_cmd(cmd, exp_name)
+            if (not exists) or (not is_train):
+                if "训练中" in state_str or "可能卡住" in state_str:
+                    state_str = f"未运行（上次 pid={last_pid} 已结束/不匹配） | " + state_str
+                rendered["diag"] = (
+                    (str(rendered.get("diag") or "").strip() + "\n\n").strip()
+                    + f"进程状态：最近一次 train_start pid={last_pid} 当前未运行（或 cmd 不匹配）。"
+                ).strip()
+        # If no events, fallback to legacy parser
+        if not evs and train_log_tail.strip():
+            progress, status = parse_train_progress(train_log_tail, 0)
+            state_str = status
+            rendered["epoch_pct"] = progress
+            rendered["step_pct"] = 0
+            rendered["elapsed_sec"] = None
+            rendered["eta_sec"] = None
+            rendered["eta_note"] = ""
+            rendered["avg_step_sec"] = None
+            rendered["last_step_sec"] = None
+            rendered["losses"] = {}
+        time_html, speed_html, loss_html = _render_train_cards_html(state_str, rendered)
+        train_summary = str(rendered.get("summary") or "")
+        train_events_txt = str(rendered.get("events") or "")
+        train_diag_txt = str(rendered.get("diag") or "")
+        epoch_pct = int(rendered.get("epoch_pct") or 0)
+        step_pct = int(rendered.get("step_pct") or 0)
+    except Exception:
+        state_str = i18n("未开始")
+        epoch_pct = 0
+        step_pct = 0
+        time_html, speed_html, loss_html = _render_train_cards_html(state_str, {"elapsed_sec": None, "eta_sec": None, "eta_note": "", "avg_step_sec": None, "last_step_sec": None, "losses": {}})
+        train_diag_txt = ""
+        train_events_txt = ""
+        train_summary = ""
+
+    info_msg = (
+        f"已加载实验：{exp_name}\n"
+        f"- 训练集路径：{trainset_dir or '（未知）'}\n"
+        f"- sr：{sr2_val}\n"
+        f"- version：{version_val}\n"
+        f"- if_f0：{if_f0_val}\n"
+        f"- preprocess: 0_gt_wavs={gt_cnt}, 1_16k_wavs={wav16_cnt}\n"
+        f"- feature: {fea_dir}={fea_cnt}\n"
+        f"- train: {state_str}"
+    )
+
+    return (
+        exp_name,
+        trainset_dir,
+        {"__type__": "update", "value": sr2_val},
+        {"__type__": "update", "value": bool(if_f0_val)},
+        {"__type__": "update", "value": version_val},
+        pg_update,
+        pd_update,
+        info_msg,
+        preprocess_info,
+        extract_info,
+        save_epoch_update,
+        total_epoch_update,
+        batch_size_update,
+        log_interval_update,
+        gpus_update,
+        if_latest_update,
+        if_cache_update,
+        save_weights_update,
+        get_train_runtime_status_ui(exp_name),
+        state_str,
+        epoch_pct,
+        step_pct,
+        time_html,
+        speed_html,
+        loss_html,
+        train_diag_txt,
+        train_events_txt,
+        train_summary,
+        train_log_tail,
+        # legacy hidden outputs
+        train_summary or train_log_tail,
+        epoch_pct,
+        state_str,
+    )
+
+
+def _refresh_exp_choices():
+    return {"__type__": "update", "choices": _safe_list_log_experiments()}
+
+
+def _browse_directory(current_value: str):
+    """
+    Server-side native directory picker (tkinter). Works for local WebUI.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        initial = current_value if current_value and os.path.isdir(current_value) else now_dir
+        selected = filedialog.askdirectory(initialdir=initial)
+        root.destroy()
+        if selected:
+            return selected
+        return current_value
+    except Exception:
+        return current_value
+
+
+def _tail_jsonl_file(path: str, max_chars: int = 200000) -> list[dict]:
+    """
+    Read tail of a JSONL file and parse objects (best-effort).
+    """
+    try:
+        if not os.path.exists(path):
+            return []
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - max_chars)
+            f.seek(start, os.SEEK_SET)
+            data = f.read()
+        text = data.decode("utf-8", errors="replace")
+        if start > 0 and "\n" in text:
+            text = text.split("\n", 1)[1]
+        out: list[dict] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    out.append(obj)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _probe_pid(pid: int) -> tuple[bool, str]:
+    """
+    Returns (exists, cmdline). Best-effort on macOS/Linux.
+    """
+    try:
+        out = subprocess.check_output(["ps", "-p", str(int(pid)), "-o", "command="], text=True).strip()
+        if not out:
+            return False, ""
+        return True, out
+    except Exception:
+        return False, ""
+
+
+def _is_train_cmd(cmdline: str, exp_name: str | None = None) -> bool:
+    cmdline = cmdline or ""
+    if "infer/modules/train/train.py" not in cmdline:
+        return False
+    if exp_name:
+        # conservative match for "-e <exp>"
+        needle = f" -e {exp_name} "
+        if needle in cmdline:
+            return True
+        # sometimes command line ends with exp
+        if cmdline.endswith(f" -e {exp_name}") or cmdline.endswith(f" -e {exp_name} "):
+            return True
+        # fallback: exp appears after -e
+        if f" -e {exp_name}" in cmdline:
+            return True
+        return False
+    return True
+
+
+class JsonlTailer:
+    """
+    Incrementally read JSONL file (best-effort).
+    Keeps an internal byte offset; safe if file does not exist yet.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._offset = 0
+
+    def read_new(self) -> list[dict]:
+        try:
+            if not os.path.exists(self.path):
+                return []
+            with open(self.path, "rb") as f:
+                f.seek(self._offset, os.SEEK_SET)
+                data = f.read()
+                self._offset = f.tell()
+            if not data:
+                return []
+            text = data.decode("utf-8", errors="replace")
+            out: list[dict] = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
+
+def _format_hhmmss(seconds: float | None) -> str:
+    try:
+        if seconds is None:
+            return "—"
+        seconds = max(0, float(seconds))
+        return str(datetime.timedelta(seconds=int(seconds)))
+    except Exception:
+        return "—"
+
+
+class TrainMonitor:
+    """
+    Aggregates training events into stable UI metrics.
+    """
+
+    def __init__(self, total_epoch: int, avg_window: int = 50):
+        self.total_epoch = max(0, int(total_epoch))
+        self.avg_window = max(5, int(avg_window))
+        self.start_wall = time.time()
+        self.start_ts: float | None = None
+
+        self.device = ""
+        self.device_type = ""
+        self.batch_size: int | None = None
+
+        self.steps_per_epoch: int | None = None
+        self.epoch: int | None = None
+        self.batch_idx: int | None = None
+        self.global_step: int | None = None
+
+        self.last_step_ts: float | None = None
+        self.last_step_time: float | None = None
+        self.step_times = deque(maxlen=self.avg_window)
+
+        self.losses: dict[str, float] = {}
+        self.key_events = deque(maxlen=50)
+        self.summary_lines = deque(maxlen=200)
+
+    def update(self, events: list[dict]):
+        for ev in events:
+            et = str(ev.get("type", ""))
+            ts = ev.get("ts")
+            if self.start_ts is None and isinstance(ts, (int, float)):
+                self.start_ts = float(ts)
+
+            if et == "train_start":
+                self.device = str(ev.get("device", ""))[:64]
+                self.device_type = str(ev.get("device_type", ""))[:16]
+                try:
+                    self.batch_size = int(ev.get("batch_size")) if ev.get("batch_size") is not None else None
+                except Exception:
+                    self.batch_size = None
+                self.steps_per_epoch = ev.get("steps_per_epoch") or self.steps_per_epoch
+                if ev.get("total_epoch") is not None:
+                    try:
+                        self.total_epoch = int(ev.get("total_epoch"))
+                    except Exception:
+                        pass
+                self.key_events.appendleft("训练启动")
+            elif et == "epoch_start":
+                try:
+                    self.epoch = int(ev.get("epoch"))
+                except Exception:
+                    pass
+                if self.epoch is not None:
+                    self.key_events.appendleft(f"开始 Epoch {self.epoch}")
+            elif et == "epoch_end":
+                try:
+                    self.epoch = int(ev.get("epoch"))
+                except Exception:
+                    pass
+                if self.epoch is not None:
+                    self.key_events.appendleft(f"完成 Epoch {self.epoch}")
+            elif et == "checkpoint_saved":
+                e = ev.get("epoch")
+                gs = ev.get("global_step")
+                self.key_events.appendleft(f"保存 ckpt (epoch={e}, step={gs})")
+            elif et == "error":
+                self.key_events.appendleft("训练异常（见日志）")
+            elif et == "train_end":
+                self.key_events.appendleft("训练结束")
+            elif et == "step_end":
+                if ev.get("epoch") is not None:
+                    try:
+                        self.epoch = int(ev.get("epoch"))
+                    except Exception:
+                        pass
+                if "batch_idx" in ev and ev.get("batch_idx") is not None:
+                    try:
+                        self.batch_idx = int(ev.get("batch_idx"))
+                    except Exception:
+                        pass
+                if ev.get("global_step") is not None:
+                    try:
+                        self.global_step = int(ev.get("global_step"))
+                    except Exception:
+                        pass
+                if ev.get("steps_per_epoch") is not None:
+                    try:
+                        self.steps_per_epoch = int(ev.get("steps_per_epoch"))
+                    except Exception:
+                        pass
+
+                st = ev.get("step_time_total")
+                if isinstance(st, (int, float)) and st > 0:
+                    self.last_step_time = float(st)
+                    self.step_times.append(float(st))
+                if isinstance(ts, (int, float)):
+                    self.last_step_ts = float(ts)
+
+                for k in ("loss_disc", "loss_gen", "loss_fm", "loss_mel", "loss_kl"):
+                    v = ev.get(k)
+                    if isinstance(v, (int, float)):
+                        self.losses[k] = float(v)
+
+                # summary line (only when losses are present to avoid spam)
+                if "loss_mel" in ev:
+                    spe = self.steps_per_epoch
+                    s_in_epoch = (self.batch_idx + 1) if (self.batch_idx is not None) else None
+                    self.summary_lines.append(
+                        f"E{self.epoch}/{self.total_epoch} "
+                        f"S{s_in_epoch or '—'}/{spe or '—'} "
+                        f"step={self.global_step or '—'} "
+                        f"t={float(ev.get('step_time_total', 0)):.3f}s "
+                        f"mel={self.losses.get('loss_mel', float('nan')):.3f} "
+                        f"kl={self.losses.get('loss_kl', float('nan')):.3f}"
+                    )
+
+    def render(self, stall_threshold_sec: int = 60) -> dict[str, object]:
+        now = time.time()
+        start = self.start_ts if self.start_ts is not None else self.start_wall
+        elapsed = now - start
+
+        epoch = int(self.epoch) if self.epoch is not None else 0
+        total = int(self.total_epoch) if self.total_epoch is not None else 0
+        spe = int(self.steps_per_epoch) if self.steps_per_epoch else None
+        s_in_epoch = (int(self.batch_idx) + 1) if self.batch_idx is not None else None
+
+        if total > 0 and spe and s_in_epoch:
+            overall = ((epoch - 1) * spe + (s_in_epoch - 1)) / (total * spe) * 100.0
+            epoch_pct = int(max(0, min(100, round(overall))))
+            step_pct = int(max(0, min(100, round((s_in_epoch / spe) * 100.0))))
+        elif total > 0 and epoch > 0:
+            epoch_pct = int(max(0, min(100, round(epoch / total * 100.0))))
+            step_pct = 0
+        else:
+            epoch_pct = 0
+            step_pct = 0
+
+        avg_step = None
+        if self.step_times:
+            avg_step = sum(self.step_times) / len(self.step_times)
+
+        eta = None
+        eta_note = ""
+        if total > 0 and spe and s_in_epoch and avg_step is not None:
+            remaining_steps = max(0, (total - epoch) * spe + (spe - s_in_epoch))
+            eta = remaining_steps * avg_step
+            eta_note = f"（基于最近 {len(self.step_times)} step 均值）"
+        elif avg_step is None:
+            eta_note = "（等待 step 数据…）"
+        else:
+            eta_note = "（等待 steps_per_epoch…）"
+
+        stall = False
+        stall_age = None
+        if self.last_step_ts is not None:
+            stall_age = now - self.last_step_ts
+            stall = stall_age > stall_threshold_sec
+
+        badge = "训练中"
+        if stall:
+            badge = "可能卡住"
+        if self.key_events and self.key_events[0] == "训练结束":
+            badge = "已完成"
+
+        device_part = ""
+        if self.device_type or self.device:
+            device_part = f"device={self.device_type or self.device}"
+        step_part = f"Step {s_in_epoch or '—'}/{spe or '—'}"
+
+        state_line = f"{badge} | Epoch {epoch}/{total or '—'} | {step_part} | {device_part}".strip()
+        time_line = f"已运行：{_format_hhmmss(elapsed)} | ETA：{_format_hhmmss(eta)} {eta_note}".strip()
+        if stall and stall_age is not None:
+            time_line += f" | 最后 step：{int(stall_age)}s 前"
+
+        speed_line = "Step耗时：—"
+        if avg_step is not None:
+            speed_line = f"Step耗时：avg {avg_step:.3f}s（最近{len(self.step_times)}） / last {(self.last_step_time or 0):.3f}s"
+
+        loss_parts = []
+        for k in ("loss_mel", "loss_kl", "loss_gen", "loss_disc"):
+            if k in self.losses:
+                loss_parts.append(f"{k.replace('loss_', '')}={self.losses[k]:.3f}")
+        loss_line = " | ".join(loss_parts) if loss_parts else "Loss：—"
+
+        diag = ""
+        if stall:
+            diag = (
+                "可能卡住：长时间未观察到 step 推进。\n"
+                "- 若刚调高 workers：尝试将 DataLoader workers 改为 0/2/4 重新试\n"
+                "- 若日志/写图太频繁：增大 log_interval\n"
+                "- 若内存压力大：减小 batch_size 或 segment_size\n"
+                "- 也可能在保存 ckpt/写盘：稍等观察 raw log"
+            )
+
+        return {
+            "state": state_line,
+            "epoch_pct": epoch_pct,
+            "step_pct": step_pct,
+            "elapsed_sec": float(elapsed),
+            "eta_sec": float(eta) if eta is not None else None,
+            "eta_note": eta_note,
+            "avg_step_sec": float(avg_step) if avg_step is not None else None,
+            "last_step_sec": float(self.last_step_time) if self.last_step_time is not None else None,
+            "losses": dict(self.losses),
+            "diag": diag,
+            "events": "\n".join(list(self.key_events)[:12]),
+            "summary": "\n".join(list(self.summary_lines)[-30:]),
+        }
+
+
+def _render_train_cards_html(state: str, rendered: dict[str, object]) -> tuple[str, str, str]:
+    """
+    Return (time_html, speed_html, loss_html)
+    """
+    elapsed = rendered.get("elapsed_sec")
+    eta = rendered.get("eta_sec")
+    eta_note = str(rendered.get("eta_note") or "")
+    avg_step = rendered.get("avg_step_sec")
+    last_step = rendered.get("last_step_sec")
+    losses = rendered.get("losses") or {}
+    if not isinstance(losses, dict):
+        losses = {}
+
+    # simple state color
+    badge = "info"
+    if "可能卡住" in (state or ""):
+        badge = "warn"
+    if "已完成" in (state or ""):
+        badge = "ok"
+    if "异常" in (state or ""):
+        badge = "err"
+
+    def fmt(sec):
+        return _format_hhmmss(sec) if sec is not None else "—"
+
+    time_html = f"""
+<div style="display:flex; gap:12px; flex-wrap:wrap;">
+  <div style="flex:1; min-width:160px; padding:12px; border:1px solid #e6e6e6; border-radius:10px;">
+    <div style="font-size:12px; color:#666;">已运行</div>
+    <div style="font-size:22px; font-weight:700; font-variant-numeric: tabular-nums;">{fmt(elapsed)}</div>
+  </div>
+  <div style="flex:1; min-width:160px; padding:12px; border:1px solid #e6e6e6; border-radius:10px;">
+    <div style="font-size:12px; color:#666;">ETA</div>
+    <div style="font-size:22px; font-weight:700; font-variant-numeric: tabular-nums;">{fmt(eta)}</div>
+    <div style="font-size:12px; color:#888; margin-top:4px;">{eta_note}</div>
+  </div>
+</div>
+"""
+
+    speed_html = f"""
+<div style="display:flex; gap:12px; flex-wrap:wrap;">
+  <div style="flex:1; min-width:160px; padding:12px; border:1px solid #e6e6e6; border-radius:10px;">
+    <div style="font-size:12px; color:#666;">平均 step</div>
+    <div style="font-size:22px; font-weight:700; font-variant-numeric: tabular-nums;">{(f"{avg_step:.3f}s" if isinstance(avg_step,(int,float)) else "—")}</div>
+  </div>
+  <div style="flex:1; min-width:160px; padding:12px; border:1px solid #e6e6e6; border-radius:10px;">
+    <div style="font-size:12px; color:#666;">最近 step</div>
+    <div style="font-size:22px; font-weight:700; font-variant-numeric: tabular-nums;">{(f"{last_step:.3f}s" if isinstance(last_step,(int,float)) else "—")}</div>
+  </div>
+</div>
+"""
+
+    def lossv(k):
+        v = losses.get(k)
+        return f"{float(v):.3f}" if isinstance(v, (int, float)) else "—"
+
+    loss_html = f"""
+<div style="display:flex; gap:12px; flex-wrap:wrap;">
+  <div style="flex:1; min-width:120px; padding:10px; border:1px solid #e6e6e6; border-radius:10px;">
+    <div style="font-size:12px; color:#666;">mel</div>
+    <div style="font-size:18px; font-weight:700; font-variant-numeric: tabular-nums;">{lossv("loss_mel")}</div>
+  </div>
+  <div style="flex:1; min-width:120px; padding:10px; border:1px solid #e6e6e6; border-radius:10px;">
+    <div style="font-size:12px; color:#666;">kl</div>
+    <div style="font-size:18px; font-weight:700; font-variant-numeric: tabular-nums;">{lossv("loss_kl")}</div>
+  </div>
+  <div style="flex:1; min-width:120px; padding:10px; border:1px solid #e6e6e6; border-radius:10px;">
+    <div style="font-size:12px; color:#666;">gen</div>
+    <div style="font-size:18px; font-weight:700; font-variant-numeric: tabular-nums;">{lossv("loss_gen")}</div>
+  </div>
+  <div style="flex:1; min-width:120px; padding:10px; border:1px solid #e6e6e6; border-radius:10px;">
+    <div style="font-size:12px; color:#666;">disc</div>
+    <div style="font-size:18px; font-weight:700; font-variant-numeric: tabular-nums;">{lossv("loss_disc")}</div>
+  </div>
+</div>
+"""
+
+    return time_html, speed_html, loss_html
+
+
 _RE_TRAIN_EPOCH_PCT = re.compile(r"Train Epoch:\s*(\d+)\s*\[\s*(\d+)%\s*\]")
 _RE_EPOCH_DONE = re.compile(r"====>\s*Epoch:\s*(\d+)\b")
 _RE_EPOCH_ELAPSED = re.compile(r"====>\s*Epoch:\s*(\d+).*?\|\s*\(([^)]+)\)")
@@ -410,6 +1417,8 @@ def parse_train_progress(log_text: str, total_epoch):
 def preprocess_dataset(trainset_dir, exp_dir, sr, n_p):
     sr = sr_dict[sr]
     os.makedirs("%s/logs/%s" % (now_dir, exp_dir), exist_ok=True)
+    # Persist trainset_dir for future "history experiment" auto-fill
+    _write_exp_meta(exp_dir, trainset_dir=trainset_dir)
     f = open("%s/logs/%s/preprocess.log" % (now_dir, exp_dir), "w")
     f.close()
     cmd = '"%s" infer/modules/train/preprocess.py "%s" %s %s "%s/logs/%s" %s %.1f' % (
@@ -904,47 +1913,125 @@ def click_train(
         logger.info("Execute: %s", cmd)
         env = os.environ.copy()
         env["RVC_TRAIN_NUM_WORKERS"] = str(train_num_workers_int)
-        p = Popen(cmd, shell=True, cwd=now_dir, env=env)
+        popen_kwargs = {"shell": True, "cwd": now_dir, "env": env}
+        # Start new session so we can pause/resume the whole group (posix)
+        if platform.system() != "Windows":
+            popen_kwargs["start_new_session"] = True
+        p = Popen(cmd, **popen_kwargs)
+        _set_train_proc(p, exp_dir1)
+
+        events_path = os.path.join(exp_dir, "train_events.jsonl")
+        tailer = JsonlTailer(events_path)
+        try:
+            total_epoch_int = int(float(total_epoch11))
+        except Exception:
+            total_epoch_int = 0
+        monitor = TrainMonitor(total_epoch=total_epoch_int, avg_window=50)
         while p.poll() is None:
             sleep(1)
-            # 实时回显 train.log（尾部），方便看到 step/epoch 进度
             log_tail = tail_text_file(train_log_path)
-            progress, status = parse_train_progress(log_tail, total_epoch11)
-            if log_tail.strip():
-                yield log_tail, progress, status
-            else:
-                yield "训练中...（等待 train.log 输出）", progress, status
+            new_events = tailer.read_new()
+            if new_events:
+                monitor.update(new_events)
+            rendered = monitor.render(stall_threshold_sec=60)
+
+            # Fallback: if no structured events yet, use legacy log parsing to show *something*
+            if not monitor.key_events and log_tail.strip():
+                progress, status = parse_train_progress(log_tail, total_epoch11)
+                rendered["state"] = status
+                rendered["epoch_pct"] = progress
+
+            summary = rendered["summary"] or ("\n".join(log_tail.splitlines()[-30:]) if log_tail else "")
+            state_str = str(rendered.get("state") or "")
+            # If paused, override badge display and avoid stall false-positive
+            if _TRAIN_PROC.get("paused"):
+                state_str = "已暂停 | " + state_str
+                rendered["diag"] = ""
+            time_html, speed_html, loss_html = _render_train_cards_html(state_str, rendered)
+
+            # New panel outputs + legacy hidden outputs
+            yield (
+                state_str,
+                int(rendered["epoch_pct"]),
+                int(rendered["step_pct"]),
+                time_html,
+                speed_html,
+                loss_html,
+                rendered["diag"],
+                rendered["events"],
+                summary,
+                log_tail,
+                summary,  # legacy info3
+                int(rendered["epoch_pct"]),  # legacy progress
+                state_str,  # legacy status
+            )
         rc = p.wait()
-        # Tolerate legacy exit codes; normally should be 0 now.
+        _clear_train_proc()
+        # Final refresh (events/log tail)
+        new_events = tailer.read_new()
+        if new_events:
+            monitor.update(new_events)
+        rendered = monitor.render(stall_threshold_sec=60)
+        log_tail = tail_text_file(train_log_path)
+        summary = rendered["summary"] or ("\n".join(log_tail.splitlines()[-30:]) if log_tail else "")
+        time_html, speed_html, loss_html = _render_train_cards_html(
+            str(rendered.get("state") or ""), rendered
+        )
+
         if rc not in (0, 149):
-            log_tail = tail_text_file(train_log_path)
-            progress, status = parse_train_progress(log_tail, total_epoch11)
-            if log_tail.strip():
-                yield (
-                    log_tail + f"\n\n训练进程异常退出(exit code={rc})",
-                    progress,
-                    status,
-                )
-            else:
-                yield (
-                    f"训练进程异常退出(exit code={rc})，请查看控制台/实验目录下 train.log",
-                    progress,
-                    status,
-                )
+            diag = (rendered["diag"] + "\n\n" if rendered["diag"] else "") + f"训练进程异常退出(exit code={rc})"
+            state = f"异常退出 (code={rc})"
+            yield (
+                state,
+                int(rendered["epoch_pct"]),
+                int(rendered["step_pct"]),
+                time_html,
+                speed_html,
+                loss_html,
+                diag,
+                rendered["events"],
+                summary,
+                log_tail,
+                summary,
+                int(rendered["epoch_pct"]),
+                state,
+            )
         else:
-            log_tail = tail_text_file(train_log_path)
-            if log_tail.strip():
-                yield log_tail + "\n\n训练结束。", 100, i18n("已完成")
-            else:
-                yield (
-                    "训练结束, 您可查看控制台训练日志或实验文件夹下的train.log",
-                    100,
-                    i18n("已完成"),
-                )
+            state = i18n("已完成")
+            yield (
+                state,
+                100,
+                100,
+                time_html,
+                speed_html,
+                loss_html,
+                "",
+                rendered["events"],
+                summary,
+                log_tail,
+                summary,
+                100,
+                state,
+            )
     except Exception:
         err = traceback.format_exc()
         logger.error(err)
-        yield err, 0, i18n("异常")
+        _clear_train_proc()
+        yield (
+            i18n("异常"),
+            0,
+            0,
+            "—",
+            "—",
+            "—",
+            err,
+            "",
+            "",
+            "",
+            err,
+            0,
+            i18n("异常"),
+        )
 
 
 # but4.click(train_index, [exp_dir1], info3)
@@ -1081,7 +2168,24 @@ def train_index_ui(exp_dir1, version19):
     UI wrapper: returns (log, progress, status) for gradio outputs.
     """
     for msg in train_index(exp_dir1, version19):
-        yield msg, 100, i18n("索引训练")
+        state = i18n("索引训练")
+        # basic cards for non-step tasks
+        time_html, speed_html, loss_html = _render_train_cards_html(state, {"elapsed_sec": None, "eta_sec": None, "eta_note": "", "avg_step_sec": None, "last_step_sec": None, "losses": {}})
+        yield (
+            state,  # state
+            100,  # epoch pct
+            0,  # step pct
+            time_html,  # time
+            speed_html,  # speed
+            loss_html,  # loss
+            "",  # diag
+            state,  # events
+            msg,  # summary
+            msg,  # raw log
+            msg,  # legacy info3
+            100,  # legacy progress
+            state,  # legacy status
+        )
 
 
 # but5.click(train1key, [exp_dir1, sr2, if_f0_3, trainset_dir4, spk_id5, gpus6, np7, f0method8, save_epoch10, total_epoch11, batch_size12, if_save_latest13, pretrained_G14, pretrained_D15, gpus16, if_cache_gpu17], info3)
@@ -1108,20 +2212,27 @@ def train1key(
     gpus_rmvpe,
 ):
     # step1:处理数据
-    yield i18n("step1:正在处理数据"), 0, i18n("数据处理")
+    msg = i18n("step1:正在处理数据")
+    time_html, speed_html, loss_html = _render_train_cards_html(i18n("数据处理"), {"elapsed_sec": None, "eta_sec": None, "eta_note": "", "avg_step_sec": None, "last_step_sec": None, "losses": {}})
+    yield (i18n("数据处理"), 0, 0, time_html, speed_html, loss_html, "", msg, msg, msg, msg, 0, i18n("数据处理"))
     for log in preprocess_dataset(trainset_dir4, exp_dir1, sr2, np7):
-        yield log, 0, i18n("数据处理")
+        time_html, speed_html, loss_html = _render_train_cards_html(i18n("数据处理"), {"elapsed_sec": None, "eta_sec": None, "eta_note": "", "avg_step_sec": None, "last_step_sec": None, "losses": {}})
+        yield (i18n("数据处理"), 0, 0, time_html, speed_html, loss_html, "", "", log, log, log, 0, i18n("数据处理"))
 
     # step2a:提取音高
-    yield i18n("step2:正在提取音高&正在提取特征"), 0, i18n("特征提取")
+    msg = i18n("step2:正在提取音高&正在提取特征")
+    time_html, speed_html, loss_html = _render_train_cards_html(i18n("特征提取"), {"elapsed_sec": None, "eta_sec": None, "eta_note": "", "avg_step_sec": None, "last_step_sec": None, "losses": {}})
+    yield (i18n("特征提取"), 0, 0, time_html, speed_html, loss_html, "", msg, msg, msg, msg, 0, i18n("特征提取"))
     for log in extract_f0_feature(
         gpus16, np7, f0method8, if_f0_3, exp_dir1, version19, gpus_rmvpe
     ):
-        yield log, 0, i18n("特征提取")
+        time_html, speed_html, loss_html = _render_train_cards_html(i18n("特征提取"), {"elapsed_sec": None, "eta_sec": None, "eta_note": "", "avg_step_sec": None, "last_step_sec": None, "losses": {}})
+        yield (i18n("特征提取"), 0, 0, time_html, speed_html, loss_html, "", "", log, log, log, 0, i18n("特征提取"))
 
     # step3a:训练模型
-    yield i18n("step3a:正在训练模型"), 0, i18n("训练中")
-    for log, progress, status in click_train(
+    msg = i18n("step3a:正在训练模型")
+    yield (i18n("训练中"), 0, 0, "—", "—", "—", "", msg, msg, msg, msg, 0, i18n("训练中"))
+    for out in click_train(
         exp_dir1,
         sr2,
         if_f0_3,
@@ -1139,13 +2250,17 @@ def train1key(
         if_save_every_weights18,
         version19,
     ):
-        yield log, progress, status
+        yield out
 
     # step3b:训练索引
-    yield i18n("step3b:正在训练索引"), 100, i18n("索引训练")
-    for log in train_index(exp_dir1, version19):
-        yield log, 100, i18n("索引训练")
-    yield i18n("全流程结束！"), 100, i18n("已完成")
+    msg = i18n("step3b:正在训练索引")
+    time_html, speed_html, loss_html = _render_train_cards_html(i18n("索引训练"), {"elapsed_sec": None, "eta_sec": None, "eta_note": "", "avg_step_sec": None, "last_step_sec": None, "losses": {}})
+    yield (i18n("索引训练"), 100, 0, time_html, speed_html, loss_html, "", msg, msg, msg, msg, 100, i18n("索引训练"))
+    for out in train_index_ui(exp_dir1, version19):
+        yield out
+    done_msg = i18n("全流程结束！")
+    time_html, speed_html, loss_html = _render_train_cards_html(i18n("已完成"), {"elapsed_sec": None, "eta_sec": None, "eta_note": "", "avg_step_sec": None, "last_step_sec": None, "losses": {}})
+    yield (i18n("已完成"), 100, 100, time_html, speed_html, loss_html, "", done_msg, done_msg, done_msg, done_msg, 100, i18n("已完成"))
 
 
 #                    ckpt_path2.change(change_info_,[ckpt_path2],[sr__,if_f0__])
@@ -1545,6 +2660,21 @@ with gr.Blocks(title="RVC WebUI") as app:
                 )
             )
             with gr.Row():
+                exp_history = gr.Dropdown(
+                    label=i18n("历史实验"),
+                    choices=_safe_list_log_experiments(),
+                    value=None,
+                    interactive=True,
+                )
+                exp_history_refresh = gr.Button(i18n("刷新实验列表"))
+                exp_history_apply = gr.Button(i18n("加载并应用到表单"), variant="primary")
+                exp_history_info = gr.Textbox(
+                    label=i18n("提示"),
+                    value=i18n("可从历史实验自动回填训练集路径/采样率/版本/是否F0。"),
+                    max_lines=4,
+                    interactive=False,
+                )
+            with gr.Row():
                 exp_dir1 = gr.Textbox(label=i18n("输入实验名"), value="mi-test")
                 sr2 = gr.Radio(
                     label=i18n("目标采样率"),
@@ -1584,6 +2714,7 @@ with gr.Blocks(title="RVC WebUI") as app:
                         label=i18n("输入训练文件夹路径"),
                         value=i18n("E:\\语音音频+标注\\米津玄师\\src"),
                     )
+                    trainset_dir_browse = gr.Button(i18n("选择目录…"))
                     spk_id5 = gr.Slider(
                         minimum=0,
                         maximum=4,
@@ -1594,12 +2725,18 @@ with gr.Blocks(title="RVC WebUI") as app:
                     )
                     but1 = gr.Button(i18n("处理数据"), variant="primary")
                     info1 = gr.Textbox(label=i18n("输出信息"), value="")
+                    trainset_dir_browse.click(
+                        fn=_browse_directory,
+                        inputs=[trainset_dir4],
+                        outputs=[trainset_dir4],
+                    )
                     but1.click(
                         preprocess_dataset,
                         [trainset_dir4, exp_dir1, sr2, np7],
                         [info1],
                         api_name="train_preprocess",
                     )
+            exp_history_refresh.click(fn=_refresh_exp_choices, inputs=[], outputs=[exp_history])
             with gr.Group():
                 gr.Markdown(
                     value=i18n(
@@ -1758,20 +2895,131 @@ with gr.Blocks(title="RVC WebUI") as app:
                     but3 = gr.Button(i18n("训练模型"), variant="primary")
                     but4 = gr.Button(i18n("训练特征索引"), variant="primary")
                     but5 = gr.Button(i18n("一键训练"), variant="primary")
-                    info3 = gr.Textbox(label=i18n("输出信息"), value="", max_lines=10)
-                    train_progress = gr.Slider(
-                        minimum=0,
-                        maximum=100,
-                        step=1,
-                        label=i18n("训练进度(%)"),
-                        value=0,
-                        interactive=False,
-                    )
-                    train_status = gr.Textbox(
-                        label=i18n("训练状态"),
+                    # New training monitor panel (A+B)
+                    train_state = gr.Textbox(
+                        label=i18n("状态"),
                         value=i18n("未开始"),
                         max_lines=1,
                         interactive=False,
+                    )
+                    with gr.Row():
+                        train_pause_btn = gr.Button(i18n("暂停训练"))
+                        train_resume_btn = gr.Button(i18n("继续训练"))
+                        train_stop_btn = gr.Button(i18n("停止训练"))
+                        train_proc_refresh = gr.Button(i18n("刷新运行状态"))
+                    with gr.Row():
+                        train_epoch_progress = gr.Slider(
+                            minimum=0,
+                            maximum=100,
+                            step=1,
+                            label=i18n("总体进度（按epoch/step估算）"),
+                            value=0,
+                            interactive=False,
+                        )
+                        train_step_progress = gr.Slider(
+                            minimum=0,
+                            maximum=100,
+                            step=1,
+                            label=i18n("本epoch进度（若可用）"),
+                            value=0,
+                            interactive=False,
+                        )
+                    train_time = gr.HTML(value="")
+                    train_speed = gr.HTML(value="")
+                    train_loss = gr.HTML(value="")
+                    with gr.Accordion(i18n("诊断与日志"), open=False):
+                        train_control_msg = gr.Textbox(
+                            label=i18n("控制操作"),
+                            value="",
+                            max_lines=2,
+                            interactive=False,
+                        )
+                        train_proc_status = gr.Textbox(
+                            label=i18n("训练进程状态"),
+                            value="",
+                            max_lines=6,
+                            interactive=False,
+                        )
+                        train_diag = gr.Textbox(
+                            label=i18n("诊断"),
+                            value="",
+                            max_lines=6,
+                            interactive=False,
+                        )
+                        train_events = gr.Textbox(
+                            label=i18n("关键事件"),
+                            value="",
+                            max_lines=8,
+                            interactive=False,
+                        )
+                        with gr.Tabs():
+                            with gr.TabItem(i18n("训练摘要")):
+                                train_log_summary = gr.Textbox(
+                                    label=i18n("摘要"),
+                                    value="",
+                                    max_lines=18,
+                                    interactive=False,
+                                )
+                            with gr.TabItem(i18n("原始日志 tail")):
+                                train_log_raw = gr.Textbox(
+                                    label=i18n("train.log"),
+                                    value="",
+                                    max_lines=18,
+                                    interactive=False,
+                                )
+
+                    train_pause_btn.click(fn=pause_training_ui, inputs=[], outputs=[train_control_msg])
+                    train_resume_btn.click(fn=resume_training_ui, inputs=[], outputs=[train_control_msg])
+                    train_stop_btn.click(fn=stop_training_ui, inputs=[], outputs=[train_control_msg])
+                    train_proc_refresh.click(fn=get_train_runtime_status_ui, inputs=[exp_dir1], outputs=[train_proc_status])
+
+                    # Legacy outputs (hidden): keep compatibility with older callbacks
+                    info3 = gr.Textbox(label=i18n("输出信息"), value="", max_lines=10, visible=False)
+                    train_progress = gr.Slider(
+                        minimum=0, maximum=100, step=1, label=i18n("训练进度(%)"), value=0, interactive=False, visible=False
+                    )
+                    train_status = gr.Textbox(
+                        label=i18n("训练状态"), value=i18n("未开始"), max_lines=1, interactive=False, visible=False
+                    )
+
+                    # Apply selected history experiment to form + snapshots (now that all outputs exist)
+                    exp_history_apply.click(
+                        fn=_apply_exp_selection,
+                        inputs=[exp_history],
+                        outputs=[
+                            exp_dir1,
+                            trainset_dir4,
+                            sr2,
+                            if_f0_3,
+                            version19,
+                            pretrained_G14,
+                            pretrained_D15,
+                            exp_history_info,
+                            info1,
+                            info2,
+                            save_epoch10,
+                            total_epoch11,
+                            batch_size12,
+                            log_interval_train,
+                            gpus16,
+                            if_save_latest13,
+                            if_cache_gpu17,
+                            if_save_every_weights18,
+                            train_proc_status,
+                            train_state,
+                            train_epoch_progress,
+                            train_step_progress,
+                            train_time,
+                            train_speed,
+                            train_loss,
+                            train_diag,
+                            train_events,
+                            train_log_summary,
+                            train_log_raw,
+                            info3,
+                            train_progress,
+                            train_status,
+                        ],
                     )
                     but3.click(
                         click_train,
@@ -1793,13 +3041,41 @@ with gr.Blocks(title="RVC WebUI") as app:
                             if_save_every_weights18,
                             version19,
                         ],
-                        [info3, train_progress, train_status],
+                        [
+                            train_state,
+                            train_epoch_progress,
+                            train_step_progress,
+                            train_time,
+                            train_speed,
+                            train_loss,
+                            train_diag,
+                            train_events,
+                            train_log_summary,
+                            train_log_raw,
+                            info3,
+                            train_progress,
+                            train_status,
+                        ],
                         api_name="train_start",
                     )
                     but4.click(
                         train_index_ui,
                         [exp_dir1, version19],
-                        [info3, train_progress, train_status],
+                        [
+                            train_state,
+                            train_epoch_progress,
+                            train_step_progress,
+                            train_time,
+                            train_speed,
+                            train_loss,
+                            train_diag,
+                            train_events,
+                            train_log_summary,
+                            train_log_raw,
+                            info3,
+                            train_progress,
+                            train_status,
+                        ],
                     )
                     but5.click(
                         train1key,
@@ -1825,7 +3101,21 @@ with gr.Blocks(title="RVC WebUI") as app:
                             version19,
                             gpus_rmvpe,
                         ],
-                        [info3, train_progress, train_status],
+                        [
+                            train_state,
+                            train_epoch_progress,
+                            train_step_progress,
+                            train_time,
+                            train_speed,
+                            train_loss,
+                            train_diag,
+                            train_events,
+                            train_log_summary,
+                            train_log_raw,
+                            info3,
+                            train_progress,
+                            train_status,
+                        ],
                         api_name="train_start_all",
                     )
 
