@@ -4,6 +4,7 @@ import logging
 import time
 from torch.profiler import profile, record_function, ProfilerActivity
 from contextlib import nullcontext
+from multiprocessing import cpu_count
 
 logger = logging.getLogger(__name__)
 
@@ -161,21 +162,30 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
+    # Device
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+        AMP_DEVICE_TYPE = "cuda"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = torch.device("xpu:0")
+        AMP_DEVICE_TYPE = "xpu"
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        AMP_DEVICE_TYPE = "mps"
+    else:
+        device = torch.device("cpu")
+        AMP_DEVICE_TYPE = "cpu"
+
+    # Use distributed only when truly multi-process
+    use_dist = (n_gpus > 1) and (device.type != "mps")
+
     # Fix for Mac MPS: do not init dist group if using MPS
-    if not (torch.backends.mps.is_available() and n_gpus == 1):
+    if use_dist:
         dist.init_process_group(
             backend="gloo", init_method="env://", world_size=n_gpus, rank=rank
         )
     torch.manual_seed(hps.train.seed)
-    if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
-        AMP_DEVICE_TYPE = "cuda"
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        AMP_DEVICE_TYPE = "xpu"
-    elif torch.backends.mps.is_available():
-        AMP_DEVICE_TYPE = "mps"
-    else:
-        AMP_DEVICE_TYPE = "cpu"
 
     if hps.if_f0 == 1:
         train_dataset = TextAudioLoaderMultiNSFsid(hps.data.training_files, hps.data)
@@ -196,15 +206,33 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         collate_fn = TextAudioCollateMultiNSFsid()
     else:
         collate_fn = TextAudioCollate()
+
+    # DataLoader tuning
+    # - MPS benefits from >0 workers when IO-bound, but too many can hurt due to spawn overhead.
+    # - Allow override via env var for easy tuning.
+    env_num_workers = os.environ.get("RVC_TRAIN_NUM_WORKERS", "").strip()
+    if env_num_workers != "":
+        num_workers = max(0, int(env_num_workers))
+    else:
+        if device.type == "mps":
+            num_workers = min(4, max(0, cpu_count() // 2))
+        elif device.type == "cuda":
+            num_workers = 4
+        else:
+            num_workers = 0
+
+    persistent_workers = num_workers > 0
+    prefetch_factor = 2 if num_workers > 0 else None
+
     train_loader = DataLoader(
         train_dataset,
-        num_workers=0, # Try 0 for Mac optimization
+        num_workers=num_workers,
         shuffle=False,
-        pin_memory=False, # Disable pin_memory for MPS
+        pin_memory=(device.type == "cuda"),
         collate_fn=collate_fn,
         batch_sampler=train_sampler,
-        persistent_workers=False, # Cannot use persistent_workers with num_workers=0
-        prefetch_factor=None, # Cannot use with num_workers=0
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
     if hps.if_f0 == 1:
         net_g = RVC_Model_f0(
@@ -221,11 +249,11 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
             **hps.model,
             is_half=hps.train.fp16_run,
         )
-    if torch.cuda.is_available():
-        net_g = net_g.cuda(rank)
     net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm)
-    if torch.cuda.is_available():
-        net_d = net_d.cuda(rank)
+
+    # Move models to device (CUDA / MPS / XPU / CPU)
+    net_g = net_g.to(device)
+    net_d = net_d.to(device)
     optim_g = torch.optim.AdamW(
         net_g.parameters(),
         hps.train.learning_rate,
@@ -242,15 +270,16 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
     # net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         pass
-    elif torch.cuda.is_available():
+    elif torch.cuda.is_available() and use_dist:
         net_g = DDP(net_g, device_ids=[rank])
         net_d = DDP(net_d, device_ids=[rank])
     elif torch.backends.mps.is_available():
         # Mac MPS: Do NOT wrap with DDP
         pass 
     else:
-        net_g = DDP(net_g)
-        net_d = DDP(net_d)
+        if use_dist:
+            net_g = DDP(net_g)
+            net_d = DDP(net_d)
 
     try:  # 如果能加载自动resume
         _, _, _, epoch_str = utils.load_checkpoint(
@@ -312,7 +341,7 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
     cache = []
     for epoch in range(epoch_str, hps.train.epochs + 1):
         if rank == 0:
-            train_and_evaluate(
+            done = train_and_evaluate(
                 rank,
                 epoch,
                 hps,
@@ -326,7 +355,7 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 cache,
             )
         else:
-            train_and_evaluate(
+            done = train_and_evaluate(
                 rank,
                 epoch,
                 hps,
@@ -339,8 +368,15 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 None,
                 cache,
             )
+        if done:
+            break
         scheduler_g.step()
         scheduler_d.step()
+    if use_dist:
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 def train_and_evaluate(
@@ -357,6 +393,11 @@ def train_and_evaluate(
 
     net_g.train()
     net_d.train()
+
+    # Determine device from model (works for DDP and non-DDP)
+    model_ref = net_g.module if hasattr(net_g, "module") else net_g
+    device = next(model_ref.parameters()).device
+    non_blocking = device.type == "cuda"
 
     # Prepare data iterator
     if hps.if_cache_data_in_gpu == True:
@@ -389,17 +430,17 @@ def train_and_evaluate(
                         sid,
                     ) = info
                 # Load on CUDA
-                if torch.cuda.is_available():
-                    phone = phone.cuda(rank, non_blocking=True)
-                    phone_lengths = phone_lengths.cuda(rank, non_blocking=True)
+                if device.type != "cpu":
+                    phone = phone.to(device, non_blocking=non_blocking)
+                    phone_lengths = phone_lengths.to(device, non_blocking=non_blocking)
                     if hps.if_f0 == 1:
-                        pitch = pitch.cuda(rank, non_blocking=True)
-                        pitchf = pitchf.cuda(rank, non_blocking=True)
-                    sid = sid.cuda(rank, non_blocking=True)
-                    spec = spec.cuda(rank, non_blocking=True)
-                    spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
-                    wave = wave.cuda(rank, non_blocking=True)
-                    wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
+                        pitch = pitch.to(device, non_blocking=non_blocking)
+                        pitchf = pitchf.to(device, non_blocking=non_blocking)
+                    sid = sid.to(device, non_blocking=non_blocking)
+                    spec = spec.to(device, non_blocking=non_blocking)
+                    spec_lengths = spec_lengths.to(device, non_blocking=non_blocking)
+                    wave = wave.to(device, non_blocking=non_blocking)
+                    wave_lengths = wave_lengths.to(device, non_blocking=non_blocking)
                 # Cache on list
                 if hps.if_f0 == 1:
                     cache.append(
@@ -459,18 +500,18 @@ def train_and_evaluate(
             ) = info
         else:
             phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = info
-        ## Load on CUDA
-        if (hps.if_cache_data_in_gpu == False) and torch.cuda.is_available():
-            phone = phone.cuda(rank, non_blocking=True)
-            phone_lengths = phone_lengths.cuda(rank, non_blocking=True)
+        ## Load on device (CUDA / MPS / XPU / CPU)
+        if hps.if_cache_data_in_gpu == False and device.type != "cpu":
+            phone = phone.to(device, non_blocking=non_blocking)
+            phone_lengths = phone_lengths.to(device, non_blocking=non_blocking)
             if hps.if_f0 == 1:
-                pitch = pitch.cuda(rank, non_blocking=True)
-                pitchf = pitchf.cuda(rank, non_blocking=True)
-            sid = sid.cuda(rank, non_blocking=True)
-            spec = spec.cuda(rank, non_blocking=True)
-            spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
-            wave = wave.cuda(rank, non_blocking=True)
-            # wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
+                pitch = pitch.to(device, non_blocking=non_blocking)
+                pitchf = pitchf.to(device, non_blocking=non_blocking)
+            sid = sid.to(device, non_blocking=non_blocking)
+            spec = spec.to(device, non_blocking=non_blocking)
+            spec_lengths = spec_lengths.to(device, non_blocking=non_blocking)
+            wave = wave.to(device, non_blocking=non_blocking)
+            # wave_lengths = wave_lengths.to(device, non_blocking=non_blocking)
 
         # Calculate
         t_start = ttime()
@@ -491,14 +532,16 @@ def train_and_evaluate(
                     z_mask,
                     (z, z_p, m_p, logs_p, m_q, logs_q),
                 ) = net_g(phone, phone_lengths, spec, spec_lengths, sid)
-            mel = spec_to_mel_torch(
-                spec,
-                hps.data.filter_length,
-                hps.data.n_mel_channels,
-                hps.data.sampling_rate,
-                hps.data.mel_fmin,
-                hps.data.mel_fmax,
-            )
+            # Target mel from GT spec does not require gradients
+            with torch.no_grad():
+                mel = spec_to_mel_torch(
+                    spec,
+                    hps.data.filter_length,
+                    hps.data.n_mel_channels,
+                    hps.data.sampling_rate,
+                    hps.data.mel_fmin,
+                    hps.data.mel_fmax,
+                )
             y_mel = commons.slice_segments(
                 mel, ids_slice, hps.train.segment_size // hps.data.hop_length
             )
@@ -667,23 +710,31 @@ def train_and_evaluate(
 
     if rank == 0:
         logger.info("====> Epoch: {} {}".format(epoch, epoch_recorder.record()))
-    if epoch >= hps.total_epoch and rank == 0:
-        logger.info("Training is done. The program is closed.")
-
-        if hasattr(net_g, "module"):
-            ckpt = net_g.module.state_dict()
-        else:
-            ckpt = net_g.state_dict()
-        logger.info(
-            "saving final ckpt:%s"
-            % (
-                savee(
-                    ckpt, hps.sample_rate, hps.if_f0, hps.name, epoch, hps.version, hps
+    # Graceful stop (avoid os._exit which leaks multiprocessing resources on macOS)
+    if epoch >= hps.total_epoch:
+        if rank == 0:
+            logger.info("Training is done. The program is closed.")
+            if hasattr(net_g, "module"):
+                ckpt = net_g.module.state_dict()
+            else:
+                ckpt = net_g.state_dict()
+            logger.info(
+                "saving final ckpt:%s"
+                % (
+                    savee(
+                        ckpt,
+                        hps.sample_rate,
+                        hps.if_f0,
+                        hps.name,
+                        epoch,
+                        hps.version,
+                        hps,
+                    )
                 )
             )
-        )
-        sleep(1)
-        os._exit(2333333)
+            sleep(1)
+        return True
+    return False
 
 
 if __name__ == "__main__":

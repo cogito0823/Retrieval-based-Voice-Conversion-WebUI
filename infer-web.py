@@ -664,6 +664,8 @@ def click_train(
     save_epoch10,
     total_epoch11,
     batch_size12,
+    log_interval,
+    train_num_workers,
     if_save_latest13,
     pretrained_G14,
     pretrained_D15,
@@ -825,8 +827,8 @@ def click_train(
             with open(config_save_path, "w", encoding="utf-8") as f:
                 # 深拷贝一份模板，避免意外修改全局模板
                 cfg = json.loads(json.dumps(config.json_config[config_path]))
-                # 默认更密集的日志输出，便于进度展示（如需更省日志可改大）
-                cfg.setdefault("train", {})["log_interval"] = 1
+                # 默认日志输出频率：优先使用模板值；若缺失则给一个较省的默认值
+                cfg.setdefault("train", {}).setdefault("log_interval", 50)
                 json.dump(
                     cfg,
                     f,
@@ -835,6 +837,30 @@ def click_train(
                     sort_keys=True,
                 )
                 f.write("\n")
+        # Always apply UI-selected log interval to experiment config
+        try:
+            log_interval_int = int(log_interval)
+            if log_interval_int < 1:
+                log_interval_int = 1
+        except Exception:
+            log_interval_int = 50
+        try:
+            with open(config_save_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cfg.setdefault("train", {})["log_interval"] = log_interval_int
+            with open(config_save_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=4, sort_keys=True)
+                f.write("\n")
+        except Exception as e:
+            logger.warning("Failed to update log_interval in %s: %s", config_save_path, e)
+
+        # DataLoader workers (passed to training script via env var)
+        try:
+            train_num_workers_int = int(train_num_workers)
+            if train_num_workers_int < 0:
+                train_num_workers_int = 0
+        except Exception:
+            train_num_workers_int = 0
 
         if gpus16:
             cmd = (
@@ -876,7 +902,9 @@ def click_train(
                 )
             )
         logger.info("Execute: %s", cmd)
-        p = Popen(cmd, shell=True, cwd=now_dir)
+        env = os.environ.copy()
+        env["RVC_TRAIN_NUM_WORKERS"] = str(train_num_workers_int)
+        p = Popen(cmd, shell=True, cwd=now_dir, env=env)
         while p.poll() is None:
             sleep(1)
             # 实时回显 train.log（尾部），方便看到 step/epoch 进度
@@ -887,8 +915,7 @@ def click_train(
             else:
                 yield "训练中...（等待 train.log 输出）", progress, status
         rc = p.wait()
-        # train.py 结束时会 os._exit(2333333)，shell 中表现为 2333333 % 256 == 149
-        # 这里把 149 视为正常完成，避免 WebUI 误报“异常退出”
+        # Tolerate legacy exit codes; normally should be 0 now.
         if rc not in (0, 149):
             log_tail = tail_text_file(train_log_path)
             progress, status = parse_train_progress(log_tail, total_epoch11)
@@ -1069,6 +1096,8 @@ def train1key(
     save_epoch10,
     total_epoch11,
     batch_size12,
+    log_interval,
+    train_num_workers,
     if_save_latest13,
     pretrained_G14,
     pretrained_D15,
@@ -1100,6 +1129,8 @@ def train1key(
         save_epoch10,
         total_epoch11,
         batch_size12,
+        log_interval,
+        train_num_workers,
         if_save_latest13,
         pretrained_G14,
         pretrained_D15,
@@ -1653,6 +1684,22 @@ with gr.Blocks(title="RVC WebUI") as app:
                         value=default_batch_size,
                         interactive=True,
                     )
+                    log_interval_train = gr.Slider(
+                        minimum=1,
+                        maximum=500,
+                        step=1,
+                        label=i18n("日志频率log_interval（每N step写一次日志/图像）"),
+                        value=50,
+                        interactive=True,
+                    )
+                    train_num_workers_ui = gr.Slider(
+                        minimum=0,
+                        maximum=int(config.n_cpu),
+                        step=1,
+                        label=i18n("DataLoader workers（0更稳，2/4通常更快）"),
+                        value=min(4, int(config.n_cpu)),
+                        interactive=True,
+                    )
                     if_save_latest13 = gr.Radio(
                         label=i18n("是否仅保存最新的ckpt文件以节省硬盘空间"),
                         choices=[i18n("是"), i18n("否")],
@@ -1736,6 +1783,8 @@ with gr.Blocks(title="RVC WebUI") as app:
                             save_epoch10,
                             total_epoch11,
                             batch_size12,
+                            log_interval_train,
+                            train_num_workers_ui,
                             if_save_latest13,
                             pretrained_G14,
                             pretrained_D15,
@@ -1765,6 +1814,8 @@ with gr.Blocks(title="RVC WebUI") as app:
                             save_epoch10,
                             total_epoch11,
                             batch_size12,
+                            log_interval_train,
+                            train_num_workers_ui,
                             if_save_latest13,
                             pretrained_G14,
                             pretrained_D15,
